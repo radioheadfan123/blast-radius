@@ -1,5 +1,6 @@
 """Blast Radius selector: pick the tests a sqlglot patch can break, from maps built on the pinned commit."""
 import ast
+import importlib.util
 import json
 import os
 import re
@@ -321,11 +322,36 @@ GATES = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",  #
          "tests/test_parser.py::TestParser::test_max_nodes": "nodes"}
 
 
-def unchanged(name, patch, files):
+TPC = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
+
+
+def same_inputs(path, hunks):
+    """True if a TPC fixture edit leaves every query's options and input SQL as tests/helpers.py reads them, so only
+    expected outputs change. TestExecutor loads both files in setUpClass but reads expected SQL only in
+    test_optimized_tpch, and only TPC-H's."""
+    try:
+        spec = importlib.util.spec_from_file_location("fixture_helpers", SRC / "tests" / "helpers.py")
+        h = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(h)
+        new = Path("/tmp/fixture") / path
+        new.parent.mkdir(parents=True, exist_ok=True)
+        new.write_text("\n".join(pu.apply((SRC / path).read_text(encoding="utf-8").splitlines(), hunks)) + "\n",
+                       encoding="utf-8")
+        read = lambda f: [(meta, sql) for meta, sql, _ in h.load_sql_fixture_pairs(str(f))]  # absolute path wins the join
+        return read(new) == read((SRC / path).resolve())
+    except Exception:  # noqa: a fixture the loader cannot read breaks setUpClass
+        return False
+
+
+def gateable(num, files, sel):
+    """The gate replays test num on the pinned fixtures, so every file the test reads must be a sqlglot module it can
+    import patched; data files the test never opens do not matter."""
+    return all(GATE.fullmatch(p) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
+
+
+def unchanged(name, patch):
     """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
     that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
-    if not files or not all(GATE.fullmatch(p) for p in files):
-        return False
     left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
     if left < 10:
         return False
@@ -344,16 +370,22 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
     gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
+    ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         files = pu.parse(patch.read_text())
-        chosen, whys = set(), []
+        chosen, whys, sel = set(), [], {}
         for path, hunks in files.items():
             got, why = select(path, hunks, maps, every)
+            if why == "fixture" and path in TPC and same_inputs(path, hunks):
+                got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
+                       or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
+                why = "fixture-inputs"
             whys.append(why)
+            sel[path] = got
             chosen |= every if got is None else got
         for num, name in gated.items():
-            if num in chosen and unchanged(name, patch, files):
+            if num in chosen and gateable(num, files, sel) and unchanged(name, patch):
                 chosen.discard(num)
                 whys.append(f"{name}-gate")
         cost, ws = split(chosen, ms)

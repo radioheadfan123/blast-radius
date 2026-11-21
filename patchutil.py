@@ -73,6 +73,8 @@ def overlay(patch, src):
     """Import sqlglot from src, with the files patch edits applied into /tmp (read-only disk) and imported instead."""
     over = {}
     for rel, hunks in (parse(open(patch).read()) if patch else {}).items():
+        if not rel.endswith(".py"):
+            continue  # gates read the pinned fixtures; the selector only gates a test on data files it never opens
         p = os.path.join("/tmp/gate", rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         open(p, "w").write("\n".join(apply(open(os.path.join(src, rel)).read().splitlines(), hunks)) + "\n")
