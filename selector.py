@@ -214,10 +214,12 @@ def same_meaning(old, new):
     return ast.dump(ta) == ast.dump(tb) and b.mixin_is <= a.mixin_is
 
 
-def readers(name, m):
-    """Tests that ran a line reading `name` at call time; None if anything reads it at import time."""
+def readers(name, m, attr_ok=False):
+    """Tests that ran a line reading `name` at call time; None if anything reads it at import time.
+    attr_ok: import-time `.name` reads are known to hit other classes' copies, only bare-word reads count."""
     sources()
     word = re.compile(r"\b%s\b" % re.escape(name))
+    bare = re.compile(r"(?<!\.)\b%s\b" % re.escape(name))
     define = re.compile(r"^\s*%s\s*(:[^=]*)?=[^=]" % re.escape(name))
     out = set()
     for rel, text in _src.items():
@@ -230,10 +232,22 @@ def readers(name, m):
             if not word.search(line) or define.match(line) or line.lstrip().startswith("#"):
                 continue
             lo, hi = _rng[rel].get(i, (i, i))
-            if any(l in imp for l in range(lo, hi + 1)):
+            if any(l in imp for l in range(lo, hi + 1)) and (not attr_ok or bare.search(line)):
                 return None
             out |= tests_in(fm, m["sets"], lo, hi)
     return out
+
+
+_impread = []
+
+
+def read_at_import(key, name):
+    """True if import or test collection read attribute `name` through class `key` (module.Qualname)."""
+    if not _impread:
+        p = HERE / "map" / "impread.json"
+        _impread.append(set(json.loads(p.read_text())) if p.is_file() else None)
+    s = _impread[0]
+    return s is None or key + "." + name in s or "*." + name in s
 
 
 def tests_in(fm, sets, lo, hi):
@@ -317,6 +331,12 @@ def select(path, hunks, m, every):
                 got = set(sets[m["mod"][path]]) if path in m["mod"] else set()
                 name = class_setting(tree, ln) if o is not None and w is not None else None
                 rd = readers(name, m) if name and got else None
+                if rd is None and name and got:
+                    cq = class_at(tree, ln)
+                    mod = path[:-3].replace("/", ".").removesuffix(".__init__")
+                    # TRANSFORMS feeds generator._DISPATCH_CACHE, built once per class per process: coverage misses later readers
+                    if cq and name != "TRANSFORMS" and not read_at_import(mod + "." + cq[0], name):
+                        rd = readers(name, m, attr_ok=True)
                 if rd is not None:
                     # class setting read only at call time: tests that read it while using this module's dialect
                     out |= rd & got
