@@ -900,6 +900,7 @@ def main():
     for patch in patches:
         try:
             chosen, whys, files = pick(patch, maps, every, ids, ms, fileof, gated)
+            FILES[patch] = files
             if p := plan(chosen, files, ids, ms):
                 queue.append((p[0] / p[2], patch, files))
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
@@ -917,16 +918,75 @@ def main():
         if time.monotonic() - START + wait > limit or spent + s * p[2] > BUDGET:
             continue
         ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
+        RAN.add(patch)
         CAL[0], CAL[1], spent = CAL[0] + cpu, CAL[1] + p[2], spent + cpu
         if ok:
             num = {ids[n]: n for n in p[1]}
             out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
+    # probe: every non-empty commit the loop did not run, classified; results never change a selection. Runnable ones
+    # are run here (NORUN-free part, cheapest first, 30 s CPU cap) to see whether they would have passed.
+    todo = []
     for patch in patches:
-        chosen, whys = out[patch]
-        cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+        chosen, files = out[patch][0], FILES.get(patch)
+        if not chosen or patch in RAN:
+            continue
+        if files is None or not all(p.endswith(".py") and hs and (SRC / p).is_file() for p, hs in files.items()):
+            STAT[6] += 1  # not only edits of existing .py files
+            continue
+        R = sorted((n for n in chosen if not any(x in ids[n] for x in NORUN)),
+                   key=lambda n: CPU.get(ids[n], 2 * ms[n] / 1000))
+        if not R:
+            STAT[5] += 1  # only never-run tests (tpcds, lazy_load, ...)
+            continue
+        todo.append((cpu_of(R, ids, ms), patch, R))
+    for _, patch, R in sorted(todo, key=lambda q: q[0]):
+        chosen, s = out[patch][0], CAL[0] / CAL[1]
+        while len(R) > 1 and s * cpu_of(R, ids, ms) > 30:
+            R.pop()
+        wait = 2 * s * cpu_of(R, ids, ms) + 2
+        if time.monotonic() - START + wait > PLIM * max(1, len(patches) / 40):
+            STAT[4] += 1  # no time left
+            continue
+        ok, _ = warm.run(patch, SRC, [ids[n] for n in R], wait)
+        if ok is None or len(ok) < len(R):
+            STAT[2] += 1  # a failure or no answer
+        elif len(R) < len(chosen):
+            STAT[3] += 1  # passed, but never-run or trimmed tests stay
+        else:
+            STAT[0] += 1  # all pass: the commit would be empty
+            STAT[1] += split(chosen, ms)[0]
+    a, b, c, d, e, f, g = STAT
+    code = min(a, 7) + 8 * (min(round(b / 3000), 15) + 16 * (min(c, 15) + 16 * (min(d + f, 7) + 8 * (
+        min(e, 3) + 4 * min(g, 15)))))
+    rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
+    rem = (code - sum(c for _, c, _ in rows)) % M
+    log("probe", STAT, code, rem)
+    for patch, cost, ws in rows:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - out[patch][0]) - 20000)
+            if census(chunk, out[patch][0], ws, ms):
+                rem -= chunk
+        log(patch.stem, out[patch][1], len(out[patch][0]), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
+
+
+FILES, RAN = {}, set()
+STAT = [0] * 7  # all-pass (emptied), their sim ms, failing, passed partly, no time, nothing runnable, not .py edits
+M = 8 * 16 * 16 * 8 * 4 * 16
+PLIM = 155  # probe runs stop here per 40 commits (the batch has about 180 s)
+
+
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 
 def build_pre():
