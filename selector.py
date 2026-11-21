@@ -343,8 +343,14 @@ def test_module(path, hunks, broken):
     return {n for f in mods for n, t in _tbf.get(f, ()) if t.split("[")[0] in names}
 
 
+DOCS = re.compile(r"(?:[\w./-]*\.(?:md|rst|png)|LICENSE|MANIFEST\.in|Makefile|\.gitignore|\.gitpod\.yml|"
+                  r"\.pre-commit-config\.yaml|(?:\.github|posts|pdoc|benchmarks)/[\w./-]+)")  # no test opens or imports these
+
+
 def select(path, hunks, m, every):
     sets = m["sets"]
+    if DOCS.fullmatch(path) and path not in m["fixtures"]:
+        return set(), "docs"
     if path.endswith(".py") and (SRC / path).is_file():
         tree, verdict = same_code(path, hunks)
         if verdict == "same":
@@ -466,7 +472,8 @@ def same_inputs(path, hunks):
 def gateable(num, files, sel):
     """The gate replays test num on the pinned fixtures, so every file the test reads must be a sqlglot module it can
     import patched; data files the test never opens do not matter."""
-    return all(GATE.fullmatch(p) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
+    # a .py file with no hunks was renamed or its mode changed: the gate cannot see that
+    return all((GATE.fullmatch(p) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
 def unchanged(name, patch):
@@ -503,6 +510,34 @@ def run_here(patch, nums, ids, ms):
         return None
 
 
+def pick(patch, maps, every, ids, ms, fileof, gated):
+    text = patch.read_text(encoding="utf-8", errors="replace")
+    files = pu.parse(text)
+    for b in re.findall(r"^diff --git a/.* b/(.*)$", text, re.M):
+        files.setdefault(b, [])  # binary, rename or mode-only: no hunks, still a changed file
+    chosen, whys, sel = set(), [], {}
+    for path, hunks in files.items():
+        got, why = select(path, hunks, maps, every)
+        if why == "fixture" and path in TPC and same_inputs(path, hunks):
+            got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
+                   or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
+            why = "fixture-inputs"
+        whys.append(why)
+        sel[path] = got
+        chosen |= every if got is None else got
+    for num, name in gated.items():
+        if num in chosen and gateable(num, files, sel) and unchanged(name, patch):
+            chosen.discard(num)
+            whys.append(f"{name}-gate")
+    if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
+            and not {fileof[n] for n in chosen} & SLOW):
+        ran = run_here(patch, chosen, ids, ms)
+        if ran is not None:
+            chosen = ran
+            whys.append("ran")
+    return chosen, whys
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     fileof = {t["number"]: t["file"] for t in tests}
@@ -512,27 +547,10 @@ def main():
     ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        files = pu.parse(patch.read_text())
-        chosen, whys, sel = set(), [], {}
-        for path, hunks in files.items():
-            got, why = select(path, hunks, maps, every)
-            if why == "fixture" and path in TPC and same_inputs(path, hunks):
-                got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
-                       or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
-                why = "fixture-inputs"
-            whys.append(why)
-            sel[path] = got
-            chosen |= every if got is None else got
-        for num, name in gated.items():
-            if num in chosen and gateable(num, files, sel) and unchanged(name, patch):
-                chosen.discard(num)
-                whys.append(f"{name}-gate")
-        if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
-                and not {fileof[n] for n in chosen} & SLOW):
-            ran = run_here(patch, chosen, ids, ms)
-            if ran is not None:
-                chosen = ran
-                whys.append("ran")
+        try:
+            chosen, whys = pick(patch, maps, every, ids, ms, fileof, gated)
+        except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
+            chosen, whys = every, ["error", type(x).__name__]
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
