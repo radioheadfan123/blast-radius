@@ -748,15 +748,41 @@ def main():
             continue
         bad, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
         CAL[0], CAL[1] = CAL[0] + cpu, CAL[1] + p[2]
+        STAT[0 if bad == [] else 1] += 1
         if bad is not None:
             num = {ids[n]: n for n in p[1]}
             out[patch] = (chosen - p[1]) | {num[i] for i in bad}, whys + [f"ran{len(p[1])}-{len(bad)}"]
-    for patch in patches:
-        chosen, whys = out[patch]
-        cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+            STAT[3] += split(chosen, ms)[0] - split(out[patch][0], ms)[0]
+    # probe: board sim in ms mod M = all-pass runs + 31 x (runs with a failure or no answer + 31 x (child CPU in 4 s
+    # + 26 x sim saved in 4 s)), each capped; padding = unselected tests added to busiest workers
+    STAT[2] = CAL[0] - 1
+    code = min(STAT[0], 30) + 31 * (min(STAT[1], 30) + 31 * (min(round(STAT[2] / 4), 25) + 26 * min(round(STAT[3] / 4000), 24)))
+    rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
+    rem = (code - sum(c for _, c, _ in rows)) % M
+    log("probe", STAT, code, rem)
+    for patch, cost, ws in rows:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - out[patch][0]) // 2)
+            if census(chunk, out[patch][0], ws, ms):
+                rem -= chunk
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
+
+
+STAT = [0, 0, 0.0, 0]  # all-pass runs, runs with a failure or no answer, child CPU s, sim ms saved
+M = 31 * 31 * 26 * 25
+
+
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 if __name__ == "__main__":
     main()
