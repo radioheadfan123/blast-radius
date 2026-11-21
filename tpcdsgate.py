@@ -3,7 +3,8 @@ test sends it to a worker); the executed ones go through sqlglot.executor.execut
 ROWS rows of each table, recording the optimized AST, every logical plan, every line of Python the executor compiles,
 the rows returned and the duckdb transpile (the expected side). Also the sqlglot values the executor reads per row.
 With a patch, its files are applied into /tmp and imported in place of the pinned ones.
-usage: tpcdsgate.py [PATCH]   prints the md5 digest"""
+With a patch, stops at the first query whose running digest differs from map/tpcds.steps (written by the pristine run).
+usage: tpcdsgate.py [PATCH]   prints the md5 digest, or diff"""
 import ast, csv, gzip, hashlib, importlib.util, itertools, os, pickle, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -86,7 +87,10 @@ for name, cols in TPCDS_SCHEMA.items():  # loaded as the test's setUpClass does,
 h = hashlib.md5(repr([sorted(map(str, exp.DataType.TEXT_TYPES)), sorted(map(str, exp.DataType.NUMERIC_TYPES)),
                       sorted(Generator.TIME_PART_SINGULARS.items()), [(d.name, str(d.value)) for d in exp.DType],
                       [is_int(x) for x in ("1", "-2", "a", "1.5", "")], seq_get([1], 0), seq_get([1], 3)]).encode())
-for meta, sql, _ in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"):
+STEPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map", "tpcds.steps")  # pristine running digest per query
+want = open(STEPS).read().split() if len(sys.argv) > 1 and os.path.exists(STEPS) else None
+prefix = []
+for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")):
     out.clear(), code.clear()
     try:
         e = pickle.loads(pickle.dumps(parse_one(sql)))  # the test parses every query and pickles it to a worker
@@ -97,4 +101,13 @@ for meta, sql, _ in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"):
     except Exception as x:  # noqa
         out += ["ERR", type(x).__name__]
     h.update("\n".join(out + sorted(code)).encode() + b"\0")
+    prefix.append(h.hexdigest()[:8])
+    if want and prefix[-1] != (want[i] if i < len(want) else None):  # a running digest that differs stays different
+        print("diff")
+        sys.exit()
+if not want:
+    try:
+        open(STEPS, "w").write(" ".join(prefix))
+    except OSError:
+        pass
 print(h.hexdigest())
