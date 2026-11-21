@@ -343,7 +343,8 @@ def test_module(path, hunks, broken):
     return {n for f in mods for n, t in _tbf.get(f, ()) if t.split("[")[0] in names}
 
 
-DOCS = re.compile(r"(?:[\w./-]*\.(?:md|rst|png)|LICENSE|MANIFEST\.in|Makefile|\.gitignore|\.gitpod\.yml|"
+DOCS = re.compile(r"(?:[\w./-]*\.(?:md|rst|png)|LICENSE|MANIFEST\.in|Makefile|\.gitignore|\.gitpod\.yml|\.gitmodules|"
+                  r"sqlglot-integration-tests|sqlglot/py\.typed|"  # submodule pointer (only a test with no tests reads it)
                   r"\.pre-commit-config\.yaml|(?:\.github|posts|pdoc|benchmarks)/[\w./-]+)")  # no test opens or imports these
 
 
@@ -510,14 +511,43 @@ def run_here(patch, nums, ids, ms):
         return None
 
 
+NEW = re.compile(r"^diff --git a/(\S+) b/\1\nnew file mode", re.M)
+
+
+def new_module(path, ids):
+    """Tests that can see a brand-new sqlglot module, or None for every test. Python and pytest import a file only by
+    name, so a name nothing in the pinned tree mentions is reached only by directory listings: sqlglotc/setup.py (lists
+    subpackages, run by test_sqlglotc) and test_typing (lists sqlglot/typing)."""
+    p = Path(path)
+    if not path.startswith("sqlglot/") or p.suffix != ".py" or p.name.startswith("test") or p.name.endswith("_test.py") \
+            or p.name == "conftest.py":
+        return None  # pytest or unittest would collect it, or it is not code
+    pkg, name = (p.parent.parent, p.parent.name) if p.name == "__init__.py" else (p.parent, p.stem)
+    if (SRC / pkg / name).exists() or (SRC / pkg / f"{name}.py").exists() or not (SRC / pkg / "__init__.py").is_file():
+        return None  # shadows or turns into something that exists, or lands outside a regular package
+    word = re.compile(rf"\b{re.escape(name)}\b")
+    for top in ("sqlglot", "tests", "sqlglotc"):
+        for f in (SRC / top).rglob("*"):
+            if f.is_file() and f.suffix not in (".gz", ".pyc") and word.search(f.read_text(encoding="utf-8", errors="replace")):
+                return None  # something may import it by that name
+    return {n for n, i in ids.items() if i.startswith(("tests/test_sqlglotc.py::", "tests/test_typing.py::"))}
+
+
 def pick(patch, maps, every, ids, ms, fileof, gated):
     text = patch.read_text(encoding="utf-8", errors="replace")
     files = pu.parse(text)
     for b in re.findall(r"^diff --git a/.* b/(.*)$", text, re.M):
         files.setdefault(b, [])  # binary, rename or mode-only: no hunks, still a changed file
+    new = set(NEW.findall(text))
     chosen, whys, sel = set(), [], {}
     for path, hunks in files.items():
-        got, why = select(path, hunks, maps, every)
+        got = new_module(path, ids) if path in new and not (SRC / path).exists() else None
+        if got is not None:  # else fall through: the old rules still own every file the new rule does not claim
+            why = "new"
+        elif path.startswith("sqlglotc/"):  # only test_sqlglotc runs sqlglotc/setup.py; nothing else reads sqlglotc/
+            got, why = {n for n, i in ids.items() if i.startswith("tests/test_sqlglotc.py::")}, "sqlglotc"
+        else:
+            got, why = select(path, hunks, maps, every)
         if why == "fixture" and path in TPC and same_inputs(path, hunks):
             got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
                    or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
