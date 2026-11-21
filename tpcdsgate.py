@@ -4,31 +4,14 @@ ROWS rows of each table, recording the optimized AST, every logical plan, every 
 the rows returned and the duckdb transpile (the expected side). Also the sqlglot values the executor reads per row.
 With a patch, its files are applied into /tmp and imported in place of the pinned ones.
 usage: tpcdsgate.py [PATCH]   prints the md5 digest"""
-import ast, csv, gzip, hashlib, importlib.util, itertools, os, pickle, re, sys
+import ast, csv, gzip, hashlib, itertools, os, pickle, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import patchutil as pu  # noqa: E402
 
 SRC = os.environ.get("SQLGLOT_SRC", "/opt/sqlglot")
 ROWS = int(os.environ.get("GATE_ROWS", 200))  # rows read per table: enough for scans and filters to return rows
-over = {}
-if len(sys.argv) > 1:
-    for rel, hunks in pu.parse(open(sys.argv[1]).read()).items():
-        p = os.path.join("/tmp/gate", rel)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, "w").write("\n".join(pu.apply(open(os.path.join(SRC, rel)).read().splitlines(), hunks)) + "\n")
-        mod = rel[:-3].replace("/", ".")
-        over[mod.removesuffix(".__init__")] = (p, [os.path.join(SRC, os.path.dirname(rel))] if mod.endswith(".__init__") else None)
-
-
-class Over:
-    @staticmethod
-    def find_spec(name, path=None, target=None):
-        return importlib.util.spec_from_file_location(name, over[name][0], submodule_search_locations=over[name][1]) if name in over else None
-
-
-sys.meta_path.insert(0, Over)
-sys.path.insert(0, SRC)
+pu.overlay(sys.argv[1] if len(sys.argv) > 1 else None, SRC)
 import unittest  # noqa: E402,F401  sqlglot validates node args only under tests (expressions/core.py UNITTEST)
 
 import sqlglot.executor as ex  # noqa: E402
