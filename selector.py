@@ -550,7 +550,7 @@ NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::
 # extension; test_typing scans typing/__file__, which the overlay moves; the memory test's result depends on what ran
 # before it in its process (mutrun seed 101 caught one); the gates own the other two
 CPU = json.loads((HERE / "map" / "cpu.json").read_text())  # CPU s per test and per class setup ("<mod.Class>"), here
-KEEP = float(os.environ.get("KEEP", 0.5))  # share of a run's saving expected to survive its failures (most commits break a test)
+KEEP = float(os.environ.get("KEEP", 1.0))  # share of a run's saving expected to survive its failures (most commits break a test)
 CAL = [1.0, 1.0]  # child CPU measured, predicted: this machine's speed against the one the map was made on
 
 
@@ -748,15 +748,41 @@ def main():
             continue
         ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
         CAL[0], CAL[1] = CAL[0] + cpu, CAL[1] + p[2]
+        STAT[0 if ok is not None and len(ok) == len(p[1]) else 1] += 1
+        STAT[3] += split(chosen, ms)[0] - split(chosen - p[1], ms)[0]
         if ok:
             num = {ids[n]: n for n in p[1]}
             out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
-    for patch in patches:
-        chosen, whys = out[patch]
-        cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+            STAT[2] += split(chosen, ms)[0] - split(out[patch][0], ms)[0]
+    # probe: board sim in ms mod M = all-pass runs + 31 x (other runs + 31 x (sim saved in 3 s + 25 x saving if all had
+    # passed, in 3 s)), each capped; padding = unselected tests added to busiest workers
+    code = min(STAT[0], 30) + 31 * (min(STAT[1], 30) + 31 * (min(round(STAT[2] / 3000), 24) + 25 * min(round(STAT[3] / 3000), 25)))
+    rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
+    rem = (code - sum(c for _, c, _ in rows)) % M
+    log("probe", STAT, code, rem)
+    for patch, cost, ws in rows:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - out[patch][0]) // 2)
+            if census(chunk, out[patch][0], ws, ms):
+                rem -= chunk
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
+
+
+STAT = [0, 0, 0, 0]  # all-pass runs, other runs, sim ms saved, sim ms saved had every run passed
+M = 31 * 31 * 25 * 26
+
+
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 if __name__ == "__main__":
     main()
