@@ -24,16 +24,27 @@ GATED = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")  # selector GATE (gate v2
 V1 = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")  # already fuzzed with gate v1 (tc1, tc2), so only the newly gated files
 
 
+def capped(cmd, secs, **kw):
+    """stdout and return code, or None when it runs past secs (the whole process group is killed: pool workers too)."""
+    p = subprocess.Popen(cmd, cwd=MUT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True, **kw)
+    try:
+        return p.communicate(timeout=secs)[0], p.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        p.communicate()
+        return None
+
+
 def plan():
-    r = subprocess.run([sys.executable, GATE], env={**os.environ, "SQLGLOT_SRC": MUT}, cwd=MUT, capture_output=True,
-                       text=True, timeout=600)
-    return r.stdout.split()[-1] if r.returncode == 0 else "CRASH"
+    r = capped([sys.executable, GATE], 60, env={**os.environ, "SQLGLOT_SRC": MUT})  # the selector gives up at 30 s
+    return r[0].split()[-1] if r and r[1] == 0 else "CRASH"
 
 
 def run():
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--timeout", "300", "-rfE", *IDS],
-                       cwd=MUT, capture_output=True, text=True)
-    return {x.split("::")[-1] for x in IDS if re.search(r"^(FAILED|ERROR) " + re.escape(x), r.stdout, re.M)}
+    r = capped([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", *IDS], 150)  # normal: 25-45 s
+    if r is None:
+        return {"test_execute_tpcds", "HANG"}  # a hang fails on the board too (3 min cap)
+    return {x.split("::")[-1] for x in IDS if re.search(r"^(FAILED|ERROR) " + re.escape(x), r[0], re.M)}
 
 
 t0 = time.time()
@@ -71,5 +82,5 @@ for rel, ln in pool:
     done += 1
     print(f"{rel}:{ln} {old.strip()[:50]!r} -> {new.strip()[:50]!r} [{why}] sel {len(got)} proxy {prox} "
           f"exec {'FAIL' if 'test_execute_tpcds' in failed else 'pass'} opt {'FAIL' if 'test_tpcds' in failed else 'pass'} "
-          f"{time.time() - t0:.0f}s", flush=True)
+          f"{time.time() - t0:.0f}s{' HANG' if 'HANG' in failed else ''}", flush=True)
 print("done", done)
