@@ -308,9 +308,9 @@ def split(nums, ms):
     return best
 
 
-# Edited files that reach test_execute_tpcds only through the optimized AST, the logical plan and the duckdb transpile
-# (the executor itself, scope.py, generator.py, schema.py and the planner also run inside it, so they stay out).
-GATE = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")
+# tpcdsgate.py runs every query through the executor on small tables and digests all it builds, so any sqlglot file
+# but the executor's own (whose run-time behaviour only the full data shows) can be gated.
+GATE = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")
 
 
 START = time.monotonic()
