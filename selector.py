@@ -3,6 +3,7 @@ import ast
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -306,10 +307,24 @@ def split(nums, ms):
     return best
 
 
+# Edited files that reach test_execute_tpcds only through the optimized AST, the logical plan and the duckdb transpile
+# (the executor itself, scope.py, generator.py, schema.py and the planner also run inside it, so they stay out).
+GATE = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")
+
+
+def tpcds_unchanged(patch, files):
+    """True when tpcdsgate.py digests the patched tree the same as the pinned one, so test_execute_tpcds cannot break."""
+    if not files or not all(GATE.fullmatch(p) for p in files):
+        return False
+    r = subprocess.run([sys.executable, str(HERE / "tpcdsgate.py"), str(patch)], capture_output=True, text=True, timeout=120)
+    return r.returncode == 0 and r.stdout.split()[-1:] == (HERE / "map" / "tpcds.md5").read_text().split()
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
+    ex = next((t["number"] for t in tests if t["id"].endswith("::test_execute_tpcds")), None)
     maps = load_maps()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         files = pu.parse(patch.read_text())
@@ -318,6 +333,9 @@ def main():
             got, why = select(path, hunks, maps, every)
             whys.append(why)
             chosen |= every if got is None else got
+        if ex in chosen and tpcds_unchanged(patch, files):
+            chosen.discard(ex)
+            whys.append("tpcds-gate")
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
