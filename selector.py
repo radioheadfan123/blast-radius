@@ -317,9 +317,10 @@ START = time.monotonic()
 
 
 def tpcds_unchanged(patch, files):
-    """True when tpcdsgate.py digests the patched tree the same as the pinned one, so test_execute_tpcds cannot break."""
+    """True when tpcdsgate.py digests the patched tree the same as the pinned one, so test_execute_tpcds cannot break.
+    None when the gate cannot run on these files (census probe tells the two apart)."""
     if not files or not all(GATE.fullmatch(p) for p in files):
-        return False
+        return None
     left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
     if left < 10:
         return False
@@ -331,11 +332,26 @@ def tpcds_unchanged(patch, files):
         return False
 
 
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker, so the board's simulated total
+    rises by the sum of all codes (base-41 digits count commits per class). Adds nothing it cannot match exactly."""
+    if not code or not ws:
+        return
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
     ex = next((t["number"] for t in tests if t["id"].endswith("::test_execute_tpcds")), None)
+    gm = next((t["number"] for t in tests if t["id"].endswith("::test_generator_memory")), None)
     maps = load_maps()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         files = pu.parse(patch.read_text())
@@ -344,10 +360,18 @@ def main():
             got, why = select(path, hunks, maps, every)
             whys.append(why)
             chosen |= every if got is None else got
-        if ex in chosen and tpcds_unchanged(patch, files):
-            chosen.discard(ex)
-            whys.append("tpcds-gate")
+        code = 0
+        if ex in chosen:
+            v = tpcds_unchanged(patch, files)
+            if v:
+                chosen.discard(ex)
+                whys.append("tpcds-gate")
+            else:
+                code += 1 if v is None else 41  # kept: files the gate cannot take / gate said diff, crashed or ran late
+        if gm in chosen:
+            code += 1681
         cost, ws = split(chosen, ms)
+        census(code, chosen, ws, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
 
