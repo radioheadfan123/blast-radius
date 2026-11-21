@@ -336,7 +336,7 @@ def census(code, chosen, ws, ms):
     """Probe only: add unselected tests worth exactly `code` ms to the busiest worker, so the board's simulated total
     rises by the sum of all codes (base-41 digits count commits per class). Adds nothing it cannot match exactly."""
     if not code or not ws:
-        return
+        return not code
     rem, add = code, []
     for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
         if 0 < ms[n] <= rem:
@@ -344,6 +344,7 @@ def census(code, chosen, ws, ms):
             rem -= ms[n]
     if rem == 0:
         max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+        return True
 
 
 def main():
@@ -366,12 +367,15 @@ def main():
             if v:
                 chosen.discard(ex)
                 whys.append("tpcds-gate")
+            elif v is False:
+                code += 1  # kept: gate said diff, crashed or ran late
+            elif any(p.endswith(".py") and not GATE.fullmatch(p) for p in files):
+                code += 41  # kept: executor/* or other code the gate cannot take
             else:
-                code += 1 if v is None else 41  # kept: files the gate cannot take / gate said diff, crashed or ran late
-        if gm in chosen:
-            code += 1681
+                code += 1681  # kept: only fixtures or other non-code files beside gateable ones
         cost, ws = split(chosen, ms)
-        census(code, chosen, ws, ms)
+        if not census(code + (68921 if gm in chosen else 0), chosen, ws, ms):
+            census(code, chosen, ws, ms)  # too few unselected tests for the big digit: that one undercounts
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
 
