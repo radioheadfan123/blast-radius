@@ -550,7 +550,7 @@ NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::
 # extension; test_typing scans typing/__file__, which the overlay moves; the memory test's result depends on what ran
 # before it in its process (mutrun seed 101 caught one); the gates own the other two
 CPU = json.loads((HERE / "map" / "cpu.json").read_text())  # CPU s per test and per class setup ("<mod.Class>"), here
-KEEP = float(os.environ.get("KEEP", 0.5))  # share of a run's saving expected to survive its failures (most commits break a test)
+KEEP = float(os.environ.get("KEEP", 0.33))  # share of a run's ideal saving that survives its failures (probe-wide2: about 1/3 on practice)
 CAL = [1.0, 1.0]  # child CPU measured, predicted: this machine's speed against the one the map was made on
 
 
