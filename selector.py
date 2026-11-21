@@ -480,11 +480,13 @@ def same_inputs(path, hunks):
         return False
 
 
-def gateable(num, files, sel):
+def gateable(num, files, sel, name=""):
     """The gate replays test num on the pinned fixtures, so every file the test reads must be a sqlglot module it can
-    import patched; data files the test never opens do not matter."""
+    import patched; data files the test never opens do not matter. The tpcds gate also takes call-time executor edits:
+    it re-runs on the full tables the queries that ran the edited lines there."""
     # a .py file with no hunks was renamed or its mode changed: the gate cannot see that
-    return all((GATE.fullmatch(p) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
+    exe = lambda p: name == "tpcds" and p.startswith("sqlglot/executor/") and p.endswith(".py") and RT.get(p) is not None  # noqa: E731
+    return all(((GATE.fullmatch(p) or exe(p)) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
 def unchanged(name, patch, files=()):
@@ -655,7 +657,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         sel[path] = got
         chosen |= every if got is None else got
     for num, name in gated.items():
-        if num in chosen and gateable(num, files, sel) and unchanged(name, patch, files):
+        if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
             whys.append(f"{name}-gate")
     if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)

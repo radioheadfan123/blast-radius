@@ -7,7 +7,12 @@ compared with the pristine one (map/tpcds.steps, written by the build run). An e
 run again on the full tables, as the test does, and must return exactly the pristine columns and rows (map/tpcds.full)
 with the same duckdb SQL, within BUDGET pristine CPU seconds of such re-runs per patch.
 usage: tpcdsgate.py [PATCH]   prints the md5 digest (the pristine one when the patch passes), or diff"""
-import ast, csv, gzip, hashlib, itertools, os, pickle, re, sys, time
+import ast, csv, gzip, hashlib, itertools, os, pickle, re, resource, sys, time
+
+# a patched query that blows up (a join gone wrong) raises MemoryError here, so the test is kept, instead of the
+# container running out of memory
+if len(sys.argv) > 1:  # the build run is pristine code: never capped
+    resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import patchutil as pu  # noqa: E402
@@ -126,15 +131,17 @@ QUERIES = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
 if COV:  # each query in a fork of this process, so it runs cold, as in a fresh test worker, and caches cannot hide a line
     import json
     rel = lambda f: os.path.relpath(f, SRC)  # noqa: E731
-    cov = {"g": {}, "q": {}}
-    for f, ln in list(hit):  # ran at import or setup: an edit here can change every query
-        cov["g"].setdefault(rel(f), []).append(ln)
-    for i, (meta, sql, _) in enumerate(QUERIES):
+
+    def cold(run):
+        """The lines run() runs in a fork of this process."""
         r, w = os.pipe()
         if os.fork() == 0:
             os.close(r)
             hit.clear(), M.restart_events()
-            query(meta, sql)
+            try:
+                run()
+            except Exception:  # noqa: a failing query still ran its lines
+                pass
             M.set_events(M.COVERAGE_ID, 0)
             os.write(w, json.dumps(sorted(hit)).encode())
             os._exit(0)
@@ -144,11 +151,23 @@ if COV:  # each query in a fork of this process, so it runs cold, as in a fresh 
             data += chunk
         os.close(r)
         if os.wait()[1] or not data:
-            sys.exit("cov: query %d failed" % i)
-        for f, ln in json.loads(data):
+            sys.exit("cov: a query failed")
+        return json.loads(data)
+
+    cov = {"g": {}, "q": {}, "f": {}}
+    for i, (meta, sql, _) in enumerate(QUERIES):  # small tables, as the gate runs them
+        for f, ln in cold(lambda: query(meta, sql)):
             cov["q"].setdefault(rel(f), {}).setdefault(str(ln), []).append(i)
+    big = pickle.loads(pickle.dumps(load(None)))
+    for f, ln in list(hit):  # ran at import or setup (both table loads): an edit here can change every query
+        cov["g"].setdefault(rel(f), []).append(ln)
+    for i, (meta, sql, _) in enumerate(QUERIES):  # full tables, as the test runs them: what executor edits are checked by
+        if meta.get("execute"):
+            for f, ln in cold(lambda: full_run(pickle.loads(pickle.dumps(parse_one(sql))), sql)):
+                if rel(f).startswith("sqlglot/executor/"):
+                    cov["f"].setdefault(rel(f), {}).setdefault(str(ln), []).append(i)
     keep = lambda d: {k: v for k, v in d.items() if k.startswith("sqlglot/")}  # noqa: E731
-    open(os.path.join(MAP, "tpcds.cov"), "w").write(json.dumps({"g": keep(cov["g"]), "q": keep(cov["q"]), "n": i + 1}))
+    open(os.path.join(MAP, "tpcds.cov"), "w").write(json.dumps({k: keep(v) for k, v in cov.items()} | {"n": len(QUERIES)}))
     sys.exit()
 
 
@@ -160,31 +179,38 @@ def only():
     cov = json.load(open(os.path.join(MAP, "tpcds.cov")))
     if cov["n"] != len(QUERIES):
         return None
-    qs = set()
+    qs, fqs = set(), set()  # queries to check on the small tables; executed ones to re-run on the full tables
     for path, eds in lines.items():
-        g, q = set(cov["g"].get(path, ())), cov["q"].get(path, {})
+        full = path.startswith("sqlglot/executor/")  # its run-time behaviour shows only on the full tables
+        g, q = set(cov["g"].get(path, ())), cov["f" if full else "q"].get(path, {})
         for lo, hi, blo, bhi in eds:
             for a, b in ((lo, hi), (blo, bhi)):  # the edited statement; if no query ran it, its whole function
                 if g & set(range(a, b + 1)):
                     return None
                 got = {i for ln in range(a, b + 1) for i in q.get(str(ln), ())}
                 if got:
-                    qs |= got
+                    (fqs if full else qs).update(got)
                     break
             else:
                 return None  # no query runs this function: check them all
-    return qs
+    return qs, fqs
 
 
+EXEC_BUDGET = float(os.environ.get("GATE_EXEC_BUDGET", 12))  # pristine CPU seconds of full-data re-runs for executor edits
 try:
     ONLY = only() if patched and os.environ.get("GATE_LINES") else None
 except Exception as x:  # noqa: no map, bad input: check every query
     print("only error", repr(x), file=sys.stderr)
     ONLY = None
-print("only", None if ONLY is None else sorted(ONLY), file=sys.stderr)  # for tools
+print("only", ONLY and [sorted(x) for x in ONLY], file=sys.stderr)  # for tools
+ONLY, FULL = ONLY or (None, set())
+if patched and (ONLY is None and any(p.startswith("sqlglot/executor/") for p in pu.parse(open(sys.argv[1]).read()))
+                or sum(float(pfull.get(str(i), "x 1e9").split()[1]) for i in FULL) > EXEC_BUDGET):
+    print("diff")  # an executor edit is checked only on the full tables, of the queries that run it
+    sys.exit()
 pieces, fulls, spent, budget = [const], [], 0.0, 0.0
 for i, (meta, sql, _) in enumerate(QUERIES):
-    if ONLY is not None and i not in ONLY:
+    if ONLY is not None and i not in ONLY | FULL:
         continue  # runs no edited line: its piece is the pristine one
     e, piece = query(meta, sql)
     pieces.append(piece)
@@ -196,11 +222,11 @@ for i, (meta, sql, _) in enumerate(QUERIES):
     if not patched:
         big = big or pickle.loads(pickle.dumps(load(None)))
         fulls.append("%d %s %.3f" % (i, *full_run(e, sql)))
-    elif piece != (want[i + 1] if i + 1 < len(want) else None):
+    elif i in FULL or piece != (want[i + 1] if i + 1 < len(want) else None):
         try:
             gold, gold_t = pfull[str(i)].split()
             budget += float(gold_t)
-            if budget > BUDGET:
+            if budget > (EXEC_BUDGET if FULL else BUDGET):
                 raise TimeoutError
             if big is None:
                 big = pickle.loads(pickle.dumps(load(None)))
