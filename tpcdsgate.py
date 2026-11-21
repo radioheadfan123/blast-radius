@@ -134,6 +134,7 @@ for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-
             spent += took
         except Exception:  # noqa: over budget, or a query that fails or is missing from the pristine run
             md5, gold = None, ""
+        print("rerun", i, md5 == gold, file=sys.stderr)  # for tools/v3check.py
         if md5 != gold or spent > 2 * budget + 1:  # much slower can time the real test out
             print("diff")
             sys.exit()
