@@ -5,6 +5,7 @@ import tokenize
 import importlib.util
 import json
 import os
+import resource
 import re
 import subprocess
 import sys
@@ -536,8 +537,13 @@ def unchanged(name, patch, files=()):
         py = [p for p in files if p.endswith(".py")]
         if name == "tpcds" and py and all(RT.get(p) is not None for p in py):  # only the queries these edits can reach
             env = dict(os.environ, GATE_LINES=json.dumps({p: RT[p] for p in py}))
-        r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
-                           timeout=min(45, left), env=env)
+        t0 = _kids()
+        try:
+            r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
+                               timeout=min(45, left), env=env)
+        finally:
+            PSTAT[name] = PSTAT.get(name, 0) + _kids() - t0
+            PSTAT["n" + name] = PSTAT.get("n" + name, 0) + 1
         got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
         return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
                 and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
@@ -590,8 +596,12 @@ def lazy_ok(patch):
         try:
             if left < 10:
                 raise TimeoutError
-            r = subprocess.run([sys.executable, "-c", code, str(HERE), str(patch), str(SRC)], capture_output=True,
-                               text=True, timeout=min(30, left))
+            t0 = _kids()
+            try:
+                r = subprocess.run([sys.executable, "-c", code, str(HERE), str(patch), str(SRC)], capture_output=True,
+                                   text=True, timeout=min(30, left))
+            finally:
+                PSTAT["lazy"] = PSTAT.get("lazy", 0) + _kids() - t0
             _lazy[patch] = r.returncode == 0 and r.stdout.split() == ["1"]
         except Exception:  # noqa: timeout
             _lazy[patch] = False
@@ -748,15 +758,43 @@ def main():
             continue
         ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
         CAL[0], CAL[1] = CAL[0] + cpu, CAL[1] + p[2]
+        PSTAT["run"] = PSTAT.get("run", 0) + cpu
         if ok:
             num = {ids[n]: n for n in p[1]}
             out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
-    for patch in patches:
-        chosen, whys = out[patch]
-        cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+    g = PSTAT.get
+    T, W, O = (round(x / 0.5) for x in (g("tpcds", 0), g("run", 0), g("gen", 0) + g("nodes", 0) + g("lazy", 0)))
+    code = min(T, 127) + 128 * (min(W, 63) + 64 * (min(O, 15) + 16 * min(g("ntpcds", 0), 7)))
+    rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
+    rem = (code - sum(c for _, c, _ in rows)) % M
+    log("probe", {k: round(v, 2) for k, v in PSTAT.items()}, code, rem)
+    for patch, cost, ws in rows:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - out[patch][0]) - 20000)
+            if pad(chunk, out[patch][0], ws, ms):
+                rem -= chunk
+        log(patch.stem, out[patch][1], len(out[patch][0]), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
+
+
+# Probe only: board sim in ms mod M = T + 128 x (W + 64 x (O + 16 x N)): child CPU in 0.5 s of the tpcds gate (with
+# execall) T, warm runs W, gen + nodes gates + lazy_ok O, and N tpcds gate calls. Board CPU minus all three = the parent.
+PSTAT = {}
+M = 128 * 64 * 16 * 8   # 1048576
+_kids = lambda: (lambda r: r.ru_utime + r.ru_stime)(resource.getrusage(resource.RUSAGE_CHILDREN))  # noqa: E731
+
+
+def pad(code, chosen, ws, ms):
+    """Add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 if __name__ == "__main__":
     main()
