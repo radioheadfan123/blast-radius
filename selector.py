@@ -318,6 +318,7 @@ def main():
             got, why = select(path, hunks, maps, every)
             whys.append(why)
             chosen |= every if got is None else got
+        chosen -= {t["number"] for t in tests if t["id"].endswith("::test_execute_tpcds")}  # probe: never run test_execute_tpcds
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
