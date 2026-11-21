@@ -9,8 +9,19 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 def parse(text):
     """Return {path: [hunk, ...]}; a hunk is (old_start, [(tag, line), ...]) with tag in ' -+'."""
-    files, cur, hunk = {}, None, None
+    files, cur, hunk, ol, nl = {}, None, None, 0, 0
     for line in text.splitlines():
+        if hunk is not None and (ol > 0 or nl > 0):
+            # inside a hunk by its line counts: a removed "-- comment" line reads as "--- comment", not a file header
+            tag = line[:1] or " "
+            if tag == "\\":
+                continue
+            if tag in " -+":
+                hunk[1].append((tag, line[1:]))
+                ol -= tag != "+"
+                nl -= tag != "-"
+                continue
+            ol = nl = 0  # short hunk: fall through to header parsing
         if line.startswith("--- "):
             continue
         if line.startswith("+++ "):
@@ -21,12 +32,10 @@ def parse(text):
         m = HUNK.match(line)
         if m and cur is not None:
             hunk = (int(m.group(1)), [])
+            ol = int(m.group(2)) if m.group(2) is not None else 1
+            nl = int(m.group(4)) if m.group(4) is not None else 1
             cur.append(hunk)
             continue
-        if hunk is not None and line[:1] in (" ", "-", "+"):
-            hunk[1].append((line[0], line[1:]))
-        elif hunk is not None and line == "":
-            hunk[1].append((" ", ""))
     return files
 
 
