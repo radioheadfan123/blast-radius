@@ -485,7 +485,8 @@ def unchanged(name, patch):
         return False
 
 
-SLOW = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_lineage.py", "tests/test_sqlglotc.py"}  # setUpClass
+SLOW = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_lineage.py", "tests/test_sqlglotc.py",
+        "tests/test_typing.py"}  # setUpClass; test_typing scans typing/__file__, which the overlay moves
 RUN_MS = 1500  # below this, running the tests here (about 0.4 s to start) beats the 2 s a worker costs when none fails
 
 
