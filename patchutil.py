@@ -1,5 +1,8 @@
 """Parse and apply unified diffs against the pinned sqlglot tree."""
+import importlib.util
+import os
 import re
+import sys
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -64,3 +67,22 @@ def apply(old_lines, hunks):
                 out.append(text)
     out.extend(old_lines[pos:])
     return out
+
+
+def overlay(patch, src):
+    """Import sqlglot from src, with the files patch edits applied into /tmp (read-only disk) and imported instead."""
+    over = {}
+    for rel, hunks in (parse(open(patch).read()) if patch else {}).items():
+        p = os.path.join("/tmp/gate", rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write("\n".join(apply(open(os.path.join(src, rel)).read().splitlines(), hunks)) + "\n")
+        mod = rel[:-3].replace("/", ".")
+        over[mod.removesuffix(".__init__")] = (p, [os.path.join(src, os.path.dirname(rel))] if mod.endswith(".__init__") else None)
+
+    class Over:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            return importlib.util.spec_from_file_location(name, over[name][0], submodule_search_locations=over[name][1]) if name in over else None
+
+    sys.meta_path.insert(0, Over)
+    sys.path.insert(0, src)

@@ -426,7 +426,8 @@ def split(nums, ms):
     return best
 
 
-# tpcdsgate.py runs every query through the executor on small tables and digests all it builds, so any sqlglot file
+# Each gate replays its test cheaply and digests all it builds (tpcdsgate.py runs every query through the executor on
+# small tables, nodesgate.py parses at 1/100 width), so any sqlglot file
 # but the executor's own (whose run-time behaviour only the full data shows) can be gated.
 GATE = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")
 
@@ -434,17 +435,24 @@ GATE = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")
 START = time.monotonic()
 
 
-def tpcds_unchanged(patch, files):
-    """True when tpcdsgate.py digests the patched tree the same as the pinned one, so test_execute_tpcds cannot break."""
+GATES = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",  # test id -> <name>gate.py, map/<name>.md5
+         "tests/test_parser.py::TestParser::test_max_nodes": "nodes"}
+
+
+def unchanged(name, patch, files):
+    """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
+    that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
     if not files or not all(GATE.fullmatch(p) for p in files):
         return False
     left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
     if left < 10:
         return False
     try:
-        r = subprocess.run([sys.executable, str(HERE / "tpcdsgate.py"), str(patch)], capture_output=True, text=True,
+        r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
                            timeout=min(30, left))
-        return r.returncode == 0 and r.stdout.split()[-1:] == (HERE / "map" / "tpcds.md5").read_text().split()
+        got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
+        return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
+                and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
     except Exception:  # noqa: timeout, missing digest
         return False
 
@@ -453,7 +461,7 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
-    ex = next((t["number"] for t in tests if t["id"].endswith("::test_execute_tpcds")), None)
+    gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
     maps = load_maps()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         files = pu.parse(patch.read_text())
@@ -462,9 +470,10 @@ def main():
             got, why = select(path, hunks, maps, every)
             whys.append(why)
             chosen |= every if got is None else got
-        if ex in chosen and tpcds_unchanged(patch, files):
-            chosen.discard(ex)
-            whys.append("tpcds-gate")
+        for num, name in gated.items():
+            if num in chosen and unchanged(name, patch, files):
+                chosen.discard(num)
+                whys.append(f"{name}-gate")
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
