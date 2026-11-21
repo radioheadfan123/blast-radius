@@ -369,8 +369,12 @@ def select(path, hunks, m, every):
         for ln, o, w in edits(hunks):
             c0, c1 = span(o, w)
             reg = runtime(regs, ln, c0, c1) if o is not None and w is not None else None
+            lo, hi = rng.get(ln, (ln, ln))
+            if reg and set(range(lo, hi + 1)) & set(m["imp"].get(path, ())):
+                # a function body that also runs at import (a metaclass, a trie built for a class): coverage only sees
+                # the tests that re-ran it, not every test that uses what import built, so treat it as an import edit
+                reg = None
             if reg:
-                lo, hi = rng.get(ln, (ln, ln))
                 got = tests_in(fm, sets, lo, hi)
                 if not got:  # ponytail: edited line never ran; whole enclosing function as a cheap safety net
                     got = tests_in(fm, sets, reg[0], reg[2])
@@ -511,6 +515,24 @@ def run_here(patch, nums, ids, ms):
         return None
 
 
+_lazy = {}
+
+
+def lazy_ok(patch):
+    """test_lazy_load runs `import sqlglot` in a fresh python, which coverage never sees: True when that import, on the
+    patched tree, still loads only the default dialect, so the test cannot fail."""
+    if patch not in _lazy:
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import patchutil as pu; pu.overlay(sys.argv[2], sys.argv[3]); "
+                "import sqlglot; print(len(sqlglot.Dialect._classes))")
+        try:
+            r = subprocess.run([sys.executable, "-c", code, str(HERE), str(patch), str(SRC)], capture_output=True,
+                               text=True, timeout=30)
+            _lazy[patch] = r.returncode == 0 and r.stdout.split() == ["1"]
+        except Exception:  # noqa: timeout
+            _lazy[patch] = False
+    return _lazy[patch]
+
+
 NEW = re.compile(r"^diff --git a/(\S+) b/\1\nnew file mode", re.M)
 
 
@@ -548,6 +570,8 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
             got, why = {n for n, i in ids.items() if i.startswith("tests/test_sqlglotc.py::")}, "sqlglotc"
         else:
             got, why = select(path, hunks, maps, every)
+        if got is not None and "imp" in why.split("+") and not lazy_ok(patch):
+            got = got | {n for n, i in ids.items() if i.endswith("::test_lazy_load")}
         if why == "fixture" and path in TPC and same_inputs(path, hunks):
             got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
                    or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
