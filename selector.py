@@ -98,6 +98,31 @@ def runtime(regs, ln, c0, c1):
     return best
 
 
+def default_reads(tree, rng, ln, o, w, c0, c1):
+    """Line spans in the top-level def whose one-line literal default holds the edit (and stays a literal)
+    that read that parameter; the whole body if it calls locals()/vars(). None if no such default.
+    Defaults are built once at import, but only a statement reading the parameter can see the value."""
+    if o is None or w is None or not (o.isascii() and w.isascii()):
+        return None
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = n.args
+            pos = a.posonlyargs + a.args
+            pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults)) + list(zip(a.kwonlyargs, a.kw_defaults))
+            for arg, d in pairs:
+                if d and d.lineno == d.end_lineno == ln and d.col_offset <= c0 and c1 <= d.end_col_offset:
+                    try:
+                        ast.literal_eval(o[d.col_offset:d.end_col_offset])
+                        ast.literal_eval(w[d.col_offset:d.end_col_offset + len(w) - len(o)])
+                    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                        return None
+                    names = [x for s in n.body for x in ast.walk(s) if isinstance(x, ast.Name)]
+                    if any(x.id in ("locals", "vars") for x in names):
+                        return [(n.body[0].lineno, n.end_lineno)]
+                    return [rng.get(x.lineno, (x.lineno, x.end_lineno)) for x in names if x.id == arg.arg]
+    return None
+
+
 def class_at(tree, ln):
     """Qualified name and line span of the innermost class whose body holds line ln."""
     best, stack = None, [(tree, "")]
@@ -220,12 +245,10 @@ def tests_in(fm, sets, lo, hi):
 
 
 def undoc(tree):
-    """Blank every module, class and function docstring in place."""
-    for n in ast.walk(tree):
-        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
-            s = n.body[0]
-            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
-                s.value.value = ""
+    """Blank every bare string statement in place: docstrings, and attribute notes that Python just drops."""
+    for s in ast.walk(tree):
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+            s.value.value = ""
     return tree
 
 
@@ -276,6 +299,14 @@ def select(path, hunks, m, every):
                 out |= got
                 why.append("rt")
             else:
+                dr = default_reads(tree, rng, ln, o, w, c0, c1)
+                imp = set(m["imp"].get(path, ()))
+                if dr is not None and not any(set(range(lo, hi + 1)) & imp for lo, hi in dr):
+                    # default argument, read only at call time: tests that ran a statement reading it
+                    for lo, hi in dr:
+                        out |= tests_in(fm, sets, lo, hi)
+                    why.append("dflt")
+                    continue
                 ca = class_at(tree, ln) if path.startswith("sqlglot/expressions/") else None
                 key = ca and path[:-3].replace("/", ".") + "." + ca[0]
                 if key and key in m["cls"]:
