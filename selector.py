@@ -288,6 +288,58 @@ def same_code(path, hunks):
     return tree, "changed"
 
 
+_tbf = {}
+IMPORT = re.compile(r"^\s*(?:from (tests(?:\.\w+)*) import\s*\(?\s*(\w*)|import (tests(?:\.\w+)+))", re.M)
+
+
+def blank_tests(tree):
+    """{(class, name): dump} of every test* def directly in the module or a class body, then blank them in place."""
+    out = {}
+    for c in [tree] + [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        for s in c.body:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name.startswith("test"):
+                out[(getattr(c, "name", ""), s.name)] = ast.dump(s)
+                s.body, s.decorator_list, s.returns = [ast.Pass()], [], None
+                s.args = ast.arguments([], [], None, [], [], None, [])
+    return out
+
+
+def test_module(path, hunks, broken):
+    """Edit to a test module: tests of that module and of every test module importing it (transitively);
+    only the edited test* defs when nothing else changed and nothing else names them."""
+    if not _tbf:
+        for t in json.loads((DATA / "tests.json").read_text())["tests"]:
+            _tbf.setdefault(t["file"], []).append((t["number"], t["id"].rsplit("::", 1)[-1]))
+    if path.endswith("/__init__.py"):  # package init runs before every module under it
+        d = path[: -len("__init__.py")]
+        return {n for f, ts in _tbf.items() if f.startswith(d) for n, _ in ts}
+    texts = {str(p.relative_to(SRC)): p.read_text() for p in SRC.glob("tests/**/*.py")}
+    imps = {}
+    for f, tx in texts.items():
+        for a, b, c in IMPORT.findall(tx):
+            mod = (a or c).replace(".", "/")
+            imps.setdefault(f, set()).update({mod + ".py", mod + "/" + b + ".py"} if b else {mod + ".py"})
+    mods, grew = {path}, True
+    while grew:
+        new = {f for f, s in imps.items() if s & mods} - mods
+        grew, mods = bool(new), mods | new
+    whole = {n for f in mods for n, _ in _tbf.get(f, ())}
+    if broken:
+        return whole
+    old = texts[path]
+    a, b = ast.parse(old), ast.parse("\n".join(pu.apply(old.splitlines(), hunks)) + "\n")
+    da, db = blank_tests(a), blank_tests(b)
+    if ast.dump(a) != ast.dump(b):
+        return whole
+    names = {k[1] for k in da if da[k] != db[k]}
+    for nm in names:
+        ref = re.compile(r"\b%s\b" % re.escape(nm))
+        if any(ref.search(l) and not re.match(r"\s*(async\s+)?def %s\b" % re.escape(nm), l)
+               for f in mods for l in texts[f].splitlines()):
+            return whole
+    return {n for f in mods for n, t in _tbf.get(f, ()) if t.split("[")[0] in names}
+
+
 def select(path, hunks, m, every):
     sets = m["sets"]
     if path.endswith(".py") and (SRC / path).is_file():
@@ -296,6 +348,8 @@ def select(path, hunks, m, every):
             return set(), "same-ast"
         if verdict == "same-meaning":
             return set(), "same-meaning"
+        if path.startswith("tests/") and path not in m["fixtures"]:
+            return test_module(path, hunks, verdict == "broken"), "test"
         if verdict == "broken":
             return None, "broken"
     if path.startswith("sqlglot/") and path.endswith(".py") and (SRC / path).is_file():
