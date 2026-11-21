@@ -124,14 +124,74 @@ def class_setting(tree, ln):
     return None
 
 
-_src, _rng = {}, {}
+_src, _rng, _enums = {}, {}, {}
+
+
+def sources():
+    if not _src:
+        for p in SRC.glob("sqlglot/**/*.py"):
+            _src[str(p.relative_to(SRC))] = p.read_text()
+    return _src
+
+
+def enums():
+    """sqlglot enum class name -> 'pure' (identity equality) or 'mixin' (str/int values can equal a member)."""
+    if not _enums:
+        bases, other = {}, set()
+        for text in sources().values():
+            for name, b in re.findall(r"^\s*class (\w+)(?:\(([^)]*)\))?:", text, re.M):
+                if name in bases:
+                    other.add(name)  # name defined twice: ambiguous, never trust it
+                bases[name] = [x.strip().split(".")[-1] for x in b.split(",") if x.strip()]
+        kind = {"Enum": "pure", "IntEnum": "mixin", "StrEnum": "mixin", "IntFlag": "mixin"}
+        grew = True
+        while grew:
+            grew = False
+            for n, bs in bases.items():
+                ks = [kind[x] for x in bs if x in kind]
+                if n not in kind and ks:
+                    kind[n] = "mixin" if "mixin" in ks or {"str", "int", "float", "bytes"} & set(bs) else "pure"
+                    grew = True
+        _enums.update({n: k for n, k in kind.items() if n in bases and n not in other})
+    return _enums
+
+
+class Norm(ast.NodeTransformer):
+    """`x is None` and `x is E.MEMBER` mean `==` in Python (no __eq__ in sqlglot is truthy against None, and
+    enum members are singletons); rewrite them so an is/== swap compares equal. Counts identity tests
+    against str/int enums, where `==` -> `is` does change the answer for a plain value."""
+
+    def __init__(self):
+        self.mixin_is = 0
+
+    def kind(self, n):
+        if isinstance(n, ast.Constant) and n.value is None:
+            return "pure"
+        if isinstance(n, ast.Attribute) and n.attr.isupper():
+            v = n.value
+            return enums().get(v.id if isinstance(v, ast.Name) else v.attr if isinstance(v, ast.Attribute) else "")
+        return None
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        for i, op in enumerate(node.ops):
+            k = self.kind(node.left if i == 0 else node.comparators[i - 1]) or self.kind(node.comparators[i])
+            if k and isinstance(op, (ast.Is, ast.IsNot)):
+                self.mixin_is += k == "mixin"
+                node.ops[i] = ast.Eq() if isinstance(op, ast.Is) else ast.NotEq()
+        return node
+
+
+def same_meaning(old, new):
+    """True if the two sources differ only by is/== swaps that Python evaluates the same way."""
+    a, b = Norm(), Norm()
+    ta, tb = a.visit(ast.parse(old)), b.visit(ast.parse(new))
+    return ast.dump(ta) == ast.dump(tb) and b.mixin_is <= a.mixin_is
 
 
 def readers(name, m):
     """Tests that ran a line reading `name` at call time; None if anything reads it at import time."""
-    if not _src:
-        for p in SRC.glob("sqlglot/**/*.py"):
-            _src[str(p.relative_to(SRC))] = p.read_text()
+    sources()
     word = re.compile(r"\b%s\b" % re.escape(name))
     define = re.compile(r"^\s*%s\s*(:[^=]*)?=[^=]" % re.escape(name))
     out = set()
@@ -169,8 +229,11 @@ def same_code(path, hunks):
     except SyntaxError:
         return tree, "broken"
     head = lambda s: s.splitlines()[:2]  # a coding cookie changes how the file decodes
-    if ast.dump(tree) == ast.dump(nt) and [l for l in head(new) if "coding" in l] == [l for l in head(old) if "coding" in l]:
-        return tree, "same"
+    if [l for l in head(new) if "coding" in l] == [l for l in head(old) if "coding" in l]:
+        if ast.dump(tree) == ast.dump(nt):
+            return tree, "same"
+        if path.startswith("sqlglot/") and same_meaning(old, new):
+            return tree, "same-meaning"
     return tree, "changed"
 
 
@@ -180,6 +243,8 @@ def select(path, hunks, m, every):
         tree, verdict = same_code(path, hunks)
         if verdict == "same":
             return set(), "same-ast"
+        if verdict == "same-meaning":
+            return set(), "same-meaning"
         if verdict == "broken":
             return None, "broken"
     if path.startswith("sqlglot/") and path.endswith(".py") and (SRC / path).is_file():
