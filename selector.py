@@ -545,8 +545,10 @@ def unchanged(name, patch, files=()):
         return False
 
 
-NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::")  # a child python imports the
-# pinned tree; sqlglotc builds the C extension; test_typing scans typing/__file__, which the overlay moves
+NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::", "::test_generator_memory",
+         "::test_max_nodes", "::test_execute_tpcds")  # a child python imports the pinned tree; sqlglotc builds the C
+# extension; test_typing scans typing/__file__, which the overlay moves; the memory test's result depends on what ran
+# before it in its process (mutrun seed 101 caught one); the gates own the other two
 CPU = json.loads((HERE / "map" / "cpu.json").read_text())  # CPU s per test and per class setup ("<mod.Class>"), here
 P_FAIL = float(os.environ.get("P_FAIL", 0.3))  # chance a run selection has a failure (then it needs a worker anyway)
 CAL = [1.0, 1.0]  # child CPU measured, predicted: this machine's speed against the one the map was made on
