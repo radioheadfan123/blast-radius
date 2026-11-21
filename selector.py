@@ -704,8 +704,8 @@ def main():
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         out.append((patch.stem, chosen, ws))
-    # D = sim - safe-lazy's sim: tpcds gate = D % 204 x 0.1 s, run gate = D // 204 % 204 x 0.1 s, other = D // 41616 x 0.5 s
-    rem = min(round(CPU["tpcds"] * 10), 203) + 204 * min(round(CPU["runtests"] * 10), 203) + 41616 * round(CPU["other"] * 2)
+    # D = sim - exp-execall's sim: tpcds gate = D % 201 x 0.2 s, run gate = D // 201 % 201 x 0.2 s, other = D // 40401 x 0.5 s
+    rem = min(round(CPU["tpcds"] * 5), 200) + 201 * min(round(CPU["runtests"] * 5), 200) + 40401 * round(CPU["other"] * 2)
     log("cpu", [f"{k} {v:.2f}" for k, v in CPU.items()], rem, 0)
     for stem, chosen, ws in out:
         if rem and ws:
