@@ -3,6 +3,7 @@ full test suite on a mutated copy, report failing tests the selector skipped.
 usage (clone root, venv python, pristine sqlglot at ../sqlglot): realcheck.py N SEED KIND[,KIND] [WORKERS]"""
 import ast, json, os, random, re, shutil, subprocess, sys, time
 os.environ["SQLGLOT_SRC"] = os.path.abspath("../sqlglot")
+os.environ["DATA_DIR"] = os.path.abspath("tools")  # tests.json
 sys.path.insert(0, ".")
 import selector as S
 
@@ -36,6 +37,9 @@ for rel in sorted(m["imp"]):
     for s in ast.walk(ast.parse(text)):
         if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
             pool += [(rel, ln) for ln in range(s.lineno, s.end_lineno + 1)]
+if "test" in kinds:  # every line of the test modules
+    pool = [(str(p.relative_to(S.SRC)), ln) for p in sorted(S.SRC.glob("tests/**/*.py"))
+            for ln in range(1, len(p.read_text().split("\n")) + 1)]
 rnd.shuffle(pool)
 
 base = run()
