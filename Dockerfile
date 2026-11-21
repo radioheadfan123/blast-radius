@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir -r /app/requirements.lock
 RUN python -c "import io, tarfile, urllib.request; tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz').read())).extractall('/opt', filter='data')" \
  && mv /opt/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /opt/sqlglot
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests || true
-COPY selector.py patchutil.py tpcdsgate.py nodesgate.py gengate.py runtests.py /app/
+COPY selector.py patchutil.py tpcdsgate.py nodesgate.py gengate.py warm.py /app/
 COPY map /app/map
 RUN python /app/tpcdsgate.py > /app/map/tpcds.md5 || echo none > /app/map/tpcds.md5  # no digest: never skip
 # the lines each TPC-DS query runs, on this python; no map: the gate checks every query

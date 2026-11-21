@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import patchutil as pu
+import warm
 
 CLS_HDR = re.compile(r"^\s*(class\s|@)|_sql_names")
 
@@ -544,22 +545,34 @@ def unchanged(name, patch, files=()):
         return False
 
 
-SLOW = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_lineage.py", "tests/test_sqlglotc.py",
-        "tests/test_typing.py"}  # setUpClass; test_typing scans typing/__file__, which the overlay moves
-RUN_MS = 1500  # below this, running the tests here (about 0.4 s to start) beats the 2 s a worker costs when none fails
+NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::")  # a child python imports the
+# pinned tree; sqlglotc builds the C extension; test_typing scans typing/__file__, which the overlay moves
+CPU = json.loads((HERE / "map" / "cpu.json").read_text())  # CPU s per test and per class setup ("<mod.Class>"), here
+P_FAIL = float(os.environ.get("P_FAIL", 0.3))  # chance a run selection has a failure (then it needs a worker anyway)
+CAL = [1.0, 1.0]  # child CPU measured, predicted: this machine's speed against the one the map was made on
 
 
-def run_here(patch, nums, ids, ms):
-    """The tests among nums that fail when runtests.py runs them on the patched tree, or None to keep them all."""
-    if 100 - (time.monotonic() - START) < 20:
+def cpu_of(R, ids, ms):
+    """Predicted CPU seconds for warm.run on R: fork and sqlglot import, each class's import and setUpClass, tests."""
+    cls = {"<" + ids[n].split("::")[0][:-3].replace("/", ".") + "." + ids[n].split("::")[1] + ">" for n in R}
+    return 0.25 + sum(CPU.get(c, 0.5) for c in cls) + sum(CPU.get(ids[n], 2 * ms[n] / 1000) for n in R)
+
+
+def plan(chosen, files, ids, ms):
+    """(gain s, tests to run here, predicted CPU s) when running some of chosen here and keeping only those that
+    fail is expected to beat sending them all to workers, else None. Only edits of existing .py files: the overlay
+    imports patched modules, it cannot delete, add or rename files."""
+    if not chosen or not all(p.endswith(".py") and hs and (SRC / p).is_file() for p, hs in files.items()):
         return None
-    try:
-        r = subprocess.run([sys.executable, str(HERE / "runtests.py"), str(patch)] + [ids[n] for n in nums],
-                           capture_output=True, text=True, timeout=3 * sum(ms[n] for n in nums) / 1000 + 3)
-        num = {ids[n]: n for n in nums}
-        return {num[i] for i in json.loads(r.stdout.splitlines()[-1])} if r.returncode == 0 else None
-    except Exception:  # noqa: timeout (pytest would time the test out too), fallback, a crash
-        return None
+    s, base, best = CAL[0] / CAL[1], split(chosen, ms)[0] / 1000, None
+    run = {n for n in chosen if not any(x in ids[n] for x in NORUN)}
+    for R in (run, {n for n in run if s * CPU.get(ids[n], 9e9) <= ms[n] / 1000}):
+        c = cpu_of(R, ids, ms) if R else 0
+        rest = chosen - R
+        ev = split(rest, ms)[0] / 1000 + s * c + P_FAIL * (0.3 if rest else 2.2)
+        if R and s * c <= 20 and base - ev > 0.1 and (best is None or base - ev > best[0]):
+            best = (base - ev, R, c)
+    return best
 
 
 _lazy = {}
@@ -700,14 +713,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
             whys.append(f"{name}-gate")
-    if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
-            and not {fileof[n] for n in chosen} & SLOW
-            and not any(ids[n].endswith("::test_lazy_load") for n in chosen)):  # its child python imports the pinned tree
-        ran = run_here(patch, chosen, ids, ms)
-        if ran is not None:
-            chosen = ran
-            whys.append("ran")
-    return chosen, whys
+    return chosen, whys, files
 
 
 def main():
@@ -718,15 +724,37 @@ def main():
     gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
     ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    out, queue = {}, []
+    for patch in patches:
         try:
-            chosen, whys = pick(patch, maps, every, ids, ms, fileof, gated)
+            chosen, whys, files = pick(patch, maps, every, ids, ms, fileof, gated)
+            if p := plan(chosen, files, ids, ms):
+                queue.append((p[0] / p[2], patch, files))
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
             chosen, whys = every, ["error", type(x).__name__]
+        out[patch] = chosen, whys
+    limit = 140 * max(1, len(patches) / 40)  # the batch has 3 min for 40 commits, 4.5 for 60: runs stop well before
+    for _, patch, files in sorted(queue, key=lambda q: -q[0]):  # best saving per CPU second first
+        chosen, whys = out[patch]
+        p = plan(chosen, files, ids, ms)  # again, at this machine's measured speed
+        if not p:
+            continue
+        s = CAL[0] / CAL[1]
+        wait = 3 * s * p[2] + 5  # a patch that makes a test hang or crawl times the run out: keep everything
+        if time.monotonic() - START + wait > limit:
+            continue
+        bad, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
+        CAL[0], CAL[1] = CAL[0] + cpu, CAL[1] + p[2]
+        if bad is not None:
+            num = {ids[n]: n for n in p[1]}
+            out[patch] = (chosen - p[1]) | {num[i] for i in bad}, whys + [f"ran{len(p[1])}-{len(bad)}"]
+    for patch in patches:
+        chosen, whys = out[patch]
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
 
 if __name__ == "__main__":
     main()
