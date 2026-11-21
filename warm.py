@@ -1,7 +1,7 @@
 """Runs tests on a patched tree in a child forked from this process, as runtests.py did in a fresh python.
 The parent preloads the heavy third-party modules the tests import (numpy, pandas, duckdb) but never sqlglot, so each
 child imports sqlglot and the tests from the patched tree exactly as a fresh process would, minus the start-up cost."""
-import concurrent.futures as cf, json, os, pickle, signal, sys, unittest
+import concurrent.futures as cf, contextlib, json, os, pickle, signal, sys, unittest
 
 import patchutil as pu
 
@@ -37,26 +37,71 @@ class _Inline(cf.Executor):
         return f
 
 
+def _eq(self, first, second, msg=None):
+    """assertEqual without building a diff: every type-specific assertEqual fails exactly when not first == second."""
+    if not first == second:
+        raise self.failureException("differs")
+
+
+@contextlib.contextmanager
+def _sub(self, msg=None, **params):
+    """subTest where a failure ends its test at once (one failing subtest fails the test); a skip stays local."""
+    try:
+        yield
+    except unittest.SkipTest:
+        pass
+
+
+class _Result(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.ok, self.cur = [], None
+
+    def startTest(self, t):
+        super().startTest(t)
+        self.cur = t
+
+    def addSuccess(self, t):
+        super().addSuccess(t)
+        self.ok.append(t)
+
+    def addSkip(self, t, reason):
+        super().addSkip(t, reason)
+        self.ok.append(t)
+
+
+def _stop(*_):
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(2)  # test code that swallows the interrupt is killed instead (no answer: keep everything)
+    raise KeyboardInterrupt
+
+
 def _child(patch, src, ids):
+    """Ids of the tests that passed, or None when a failure is not pinned to one test (setUpClass, an import)."""
     for m in [m for m in sys.modules if m.split(".")[0] in ("sqlglot", "tests", "fixture_helpers")]:
         del sys.modules[m]  # anything the parent loaded from the pinned tree
     pu.overlay(patch, src)
     cf.ProcessPoolExecutor = _Inline  # before the tests import it
-    name = {f"{i.split('::')[0][:-3].replace('/', '.')}.{'.'.join(i.split('::')[1:])}": i for i in ids}
-    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(n) for n in name)
-    res = unittest.TextTestRunner(stream=open(os.devnull, "w")).run(suite)
-    bad = set()
+    unittest.TestCase._getAssertEqualityFunc = lambda self, a, b: _eq.__get__(self)
+    unittest.TestCase.subTest = _sub
+    # sorted keeps each class together: every switch of class reruns setUpClass (TestExecutor's costs 1.9 s)
+    name = {f"{i.split('::')[0][:-3].replace('/', '.')}.{'.'.join(i.split('::')[1:])}": i for i in sorted(ids)}
+    res, cut = _Result(), None
+    try:
+        unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(n) for n in name).run(res)
+    except KeyboardInterrupt:  # out of time: keep what passed, except in the module still open (its teardown is due)
+        signal.alarm(0)
+        cut = res.cur.id().rsplit(".", 2)[0] + "." if isinstance(res.cur, unittest.TestCase) else ""
     for t, _ in res.failures + res.errors + [(t, None) for t in res.unexpectedSuccesses]:
-        t = getattr(t, "test_case", t)  # a failing subTest fails its test
-        tid = t.id() if isinstance(t, unittest.TestCase) else ""
-        if tid not in name:
-            return None  # a failure not pinned to one test (setUpClass, an import): keep them all
-        bad.add(name[tid])
-    return sorted(bad)
+        if not isinstance(t, unittest.TestCase) or t.id() not in name:
+            return None
+    bad = {t.id() for t, _ in res.failures + res.errors} | {t.id() for t in res.unexpectedSuccesses}
+    return sorted(name[t.id()] for t in res.ok
+                  if t.id() in name and t.id() not in bad and not (cut is not None and t.id().startswith(cut)))
 
 
 def run(patch, src, ids, timeout):
-    """(failing ids or None when that cannot be told here, child CPU seconds)."""
+    """(ids that passed, or None when that cannot be told here; child CPU seconds)."""
     prime()
     sys.stdout.flush(), sys.stderr.flush()
     r, w = os.pipe()
@@ -65,12 +110,14 @@ def run(patch, src, ids, timeout):
         os.close(r)
         out = None
         try:
+            signal.signal(signal.SIGALRM, _stop)
             signal.alarm(max(1, int(timeout)))
             dn = os.open(os.devnull, os.O_WRONLY)
             os.dup2(dn, 1), os.dup2(dn, 2)
             out = _child(str(patch), str(src), ids)
         except BaseException:  # noqa
             out = None
+        signal.alarm(0)
         os.write(w, json.dumps(out).encode())
         os._exit(0)
     os.close(w)

@@ -550,7 +550,7 @@ NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::
 # extension; test_typing scans typing/__file__, which the overlay moves; the memory test's result depends on what ran
 # before it in its process (mutrun seed 101 caught one); the gates own the other two
 CPU = json.loads((HERE / "map" / "cpu.json").read_text())  # CPU s per test and per class setup ("<mod.Class>"), here
-P_FAIL = float(os.environ.get("P_FAIL", 0.3))  # chance a run selection has a failure (then it needs a worker anyway)
+KEEP = float(os.environ.get("KEEP", 0.5))  # share of a run's saving expected to survive its failures (most commits break a test)
 CAL = [1.0, 1.0]  # child CPU measured, predicted: this machine's speed against the one the map was made on
 
 
@@ -571,9 +571,9 @@ def plan(chosen, files, ids, ms):
     for R in (run, {n for n in run if s * CPU.get(ids[n], 9e9) <= ms[n] / 1000}):
         c = cpu_of(R, ids, ms) if R else 0
         rest = chosen - R
-        ev = split(rest, ms)[0] / 1000 + s * c + P_FAIL * (0.3 if rest else 2.2)
-        if R and s * c <= 20 and base - ev > 0.1 and (best is None or base - ev > best[0]):
-            best = (base - ev, R, c)
+        gain = KEEP * (base - split(rest, ms)[0] / 1000) - s * c
+        if R and s * c <= 20 and gain > 0.1 and (best is None or gain > best[0]):
+            best = (gain, R, c)
     return best
 
 
@@ -743,14 +743,14 @@ def main():
         if not p:
             continue
         s = CAL[0] / CAL[1]
-        wait = 3 * s * p[2] + 5  # a patch that makes a test hang or crawl times the run out: keep everything
+        wait = 2 * s * p[2] + 2  # a patch that makes a test hang or crawl times the run out: keep what passed by then
         if time.monotonic() - START + wait > limit:
             continue
-        bad, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
+        ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
         CAL[0], CAL[1] = CAL[0] + cpu, CAL[1] + p[2]
-        if bad is not None:
+        if ok:
             num = {ids[n]: n for n in p[1]}
-            out[patch] = (chosen - p[1]) | {num[i] for i in bad}, whys + [f"ran{len(p[1])}-{len(bad)}"]
+            out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
     for patch in patches:
         chosen, whys = out[patch]
         cost, ws = split(chosen, ms)
