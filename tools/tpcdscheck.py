@@ -19,12 +19,14 @@ OPS = [(r"\bTrue\b", "False"), (r"\bFalse\b", "True"), (r"\b(\d+)\b", None), (r"
 MUT = os.path.abspath("../mut")
 if not os.path.isdir(MUT):
     shutil.copytree("../sqlglot", MUT, ignore=shutil.ignore_patterns(".git", "__pycache__"))
-PLAN = os.path.abspath("tools/tpcdsplan.py")
+GATE = os.path.abspath("tpcdsgate.py")
+GATED = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")  # selector GATE
 
 
 def plan():
-    r = subprocess.run([sys.executable, PLAN, MUT], cwd=MUT, capture_output=True, text=True, timeout=600)
-    return r.stdout if r.returncode == 0 else "CRASH"
+    r = subprocess.run([sys.executable, GATE], env={**os.environ, "SQLGLOT_SRC": MUT}, cwd=MUT, capture_output=True,
+                       text=True, timeout=600)
+    return r.stdout.split()[-1] if r.returncode == 0 else "CRASH"
 
 
 def run():
@@ -35,8 +37,8 @@ def run():
 
 t0 = time.time()
 base_plan, base = plan(), run()
-print("baseline failing", base, "plan lines", base_plan.count("\n"), f"{time.time() - t0:.0f}s", flush=True)
-pool = [(f, int(ln)) for f in sorted(m["files"]) if f.startswith("sqlglot/") for ln in m["files"][f]]
+print("baseline failing", base, "gate", base_plan, f"{time.time() - t0:.0f}s", flush=True)
+pool = [(f, int(ln)) for f in sorted(m["files"]) if GATED.fullmatch(f) for ln in m["files"][f]]
 rnd.shuffle(pool)
 done = 0
 for rel, ln in pool:
