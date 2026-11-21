@@ -336,6 +336,7 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
     ex = next((t["number"] for t in tests if t["id"].endswith("::test_execute_tpcds")), None)
+    mx = next((t["number"] for t in tests if t["id"].endswith("::test_max_nodes")), None)
     maps = load_maps()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         files = pu.parse(patch.read_text())
@@ -344,6 +345,7 @@ def main():
             got, why = select(path, hunks, maps, every)
             whys.append(why)
             chosen |= every if got is None else got
+        chosen.discard(mx)  # PROBE: never run test_max_nodes, to measure what it costs on the board
         if ex in chosen and tpcds_unchanged(patch, files):
             chosen.discard(ex)
             whys.append("tpcds-gate")
