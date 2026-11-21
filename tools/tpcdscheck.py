@@ -20,7 +20,8 @@ MUT = os.path.abspath("../mut")
 if not os.path.isdir(MUT):
     shutil.copytree("../sqlglot", MUT, ignore=shutil.ignore_patterns(".git", "__pycache__"))
 GATE = os.path.abspath("tpcdsgate.py")
-GATED = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")  # selector GATE
+GATED = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")  # selector GATE (gate v2)
+V1 = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")  # already fuzzed with gate v1 (tc1, tc2), so only the newly gated files
 
 
 def plan():
@@ -38,7 +39,7 @@ def run():
 t0 = time.time()
 base_plan, base = plan(), run()
 print("baseline failing", base, "gate", base_plan, f"{time.time() - t0:.0f}s", flush=True)
-pool = [(f, int(ln)) for f in sorted(m["files"]) if GATED.fullmatch(f) for ln in m["files"][f]]
+pool = [(f, int(ln)) for f in sorted(m["files"]) if GATED.fullmatch(f) and not V1.fullmatch(f) for ln in m["files"][f]]
 rnd.shuffle(pool)
 done = 0
 for rel, ln in pool:
