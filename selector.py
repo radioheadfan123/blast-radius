@@ -319,6 +319,9 @@ def main():
             whys.append(why)
             chosen |= every if got is None else got
         cost, ws = split(chosen, ms)
+        if chosen == every:  # probe: run nothing where we would run everything
+            log(patch.stem, "probe: every -> nothing")
+            ws = []
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
 
