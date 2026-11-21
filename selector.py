@@ -232,7 +232,8 @@ def same_code(path, hunks):
     if [l for l in head(new) if "coding" in l] == [l for l in head(old) if "coding" in l]:
         if ast.dump(tree) == ast.dump(nt):
             return tree, "same"
-        if path.startswith("sqlglot/") and same_meaning(old, new):
+        swap = any(t != " " and re.search(r"\bis\b", l) for _, body in hunks for t, l in body)
+        if swap and path.startswith("sqlglot/") and same_meaning(old, new):
             return tree, "same-meaning"
     return tree, "changed"
 
