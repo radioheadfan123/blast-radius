@@ -310,7 +310,8 @@ def split(nums, ms):
 
 
 # Each gate replays its test cheaply and digests all it builds (tpcdsgate.py runs every query through the executor on
-# small tables, nodesgate.py parses at 1/100 width), so any sqlglot file
+# small tables and re-runs on the full tables the few queries whose digest differs, nodesgate.py parses at 1/100
+# width), so any sqlglot file
 # but the executor's own (whose run-time behaviour only the full data shows) can be gated.
 GATE = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")
 
@@ -357,7 +358,7 @@ def unchanged(name, patch):
         return False
     try:
         r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
-                           timeout=min(30, left))
+                           timeout=min(45, left))
         got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
         return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
                 and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
