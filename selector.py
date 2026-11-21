@@ -1,5 +1,7 @@
 """Blast Radius selector: pick the tests a sqlglot patch can break, from maps built on the pinned commit."""
 import ast
+import io
+import tokenize
 import importlib.util
 import json
 import os
@@ -367,6 +369,31 @@ DOCS = re.compile(r"(?:[\w./-]*\.(?:md|rst|png)|LICENSE|MANIFEST\.in|Makefile|\.
                   r"\.pre-commit-config\.yaml|(?:\.github|posts|pdoc|benchmarks)/[\w./-]+)")  # no test opens or imports these
 
 
+ADDS = {}  # path -> words on the patch's added lines, per file
+_words = []
+
+
+def unknown_name(path, w):
+    """True if new line w names an identifier that neither the pinned sqlglot tree nor the patch's other files
+    mention: a class setting is evaluated at import, so a missing name there breaks every test, not just its readers."""
+    if w is None:
+        return False
+    if not _words:
+        _words.append(set(re.findall(r"\w+", "\n".join(sources().values()))))
+    names = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(w.strip() + "\n").readline):
+            if tok.type == tokenize.NAME:
+                names.add(tok.string)
+    except (tokenize.TokenError, SyntaxError):
+        pass
+    names -= _words[0]
+    for p, ws in ADDS.items():
+        if p != path:
+            names -= ws
+    return bool(names)
+
+
 RT = {}  # path -> call-time edits [(lo, hi, body_lo, body_hi)] for the tpcds gate; None when any edit is not call-time
 
 
@@ -413,7 +440,7 @@ def select(path, hunks, m, every):
                     why.append("dflt")
                     continue
                 ca = class_at(tree, ln) if path.startswith("sqlglot/expressions/") else None
-                if ca and (lo <= ca[1] <= hi or any(t is not None and CLS_HDR.search(t) for t in (o, w))):
+                if ca and (lo <= ca[1] <= hi or any(t is not None and CLS_HDR.search(t) for t in (o, w)) or unknown_name(path, w)):
                     # class header, class added or deleted, or _sql_names: other modules read these at import
                     # (parser.py builds FUNCTIONS from sql_names()), so a break can fail every test
                     out |= every
@@ -434,7 +461,7 @@ def select(path, hunks, m, every):
                     # TRANSFORMS feeds generator._DISPATCH_CACHE, built once per class per process: coverage misses later readers
                     if cq and name != "TRANSFORMS" and not read_at_import(mod + "." + cq[0], name):
                         rd = readers(name, m, attr_ok=True)
-                if rd is not None:
+                if rd is not None and not unknown_name(path, w):
                     # class setting read only at call time: tests that read it while using this module's dialect
                     out |= rd & got
                     why.append("attr")
@@ -663,6 +690,8 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
     for b in re.findall(r"^diff --git a/.* b/(.*)$", text, re.M):
         files.setdefault(b, [])  # binary, rename or mode-only: no hunks, still a changed file
     new = set(NEW.findall(text))
+    ADDS.clear()
+    ADDS.update({p: {x for _, b in hs for t, l in b if t == "+" for x in re.findall(r"\w+", l)} for p, hs in files.items()})
     chosen, whys, sel = set(), [], {}
     RT.clear()
     for path, hunks in files.items():
