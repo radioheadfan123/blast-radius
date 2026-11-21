@@ -348,16 +348,19 @@ DOCS = re.compile(r"(?:[\w./-]*\.(?:md|rst|png)|LICENSE|MANIFEST\.in|Makefile|\.
                   r"\.pre-commit-config\.yaml|(?:\.github|posts|pdoc|benchmarks)/[\w./-]+)")  # no test opens or imports these
 
 
+RT = {}  # path -> call-time edits [(lo, hi, body_lo, body_hi)] for the tpcds gate; None when any edit is not call-time
+
+
 def select(path, hunks, m, every):
     sets = m["sets"]
+    RT[path] = None
     if DOCS.fullmatch(path) and path not in m["fixtures"]:
         return set(), "docs"
     if path.endswith(".py") and (SRC / path).is_file():
         tree, verdict = same_code(path, hunks)
-        if verdict == "same":
-            return set(), "same-ast"
-        if verdict == "same-meaning":
-            return set(), "same-meaning"
+        if verdict in ("same", "same-meaning"):
+            RT[path] = []
+            return set(), "same-ast" if verdict == "same" else "same-meaning"
         if path.startswith("tests/") and path not in m["fixtures"]:
             return test_module(path, hunks, verdict == "broken"), "test"
         if verdict == "broken":
@@ -365,7 +368,7 @@ def select(path, hunks, m, every):
     if path.startswith("sqlglot/") and path.endswith(".py") and (SRC / path).is_file():
         fm = m["files"].get(path, {})
         regs, rng = regions(tree), stmt_range(tree)
-        out, why = set(), []
+        out, why, rts = set(), [], []
         for ln, o, w in edits(hunks):
             c0, c1 = span(o, w)
             reg = runtime(regs, ln, c0, c1) if o is not None and w is not None else None
@@ -380,6 +383,7 @@ def select(path, hunks, m, every):
                     got = tests_in(fm, sets, reg[0], reg[2])
                 out |= got
                 why.append("rt")
+                rts.append((lo, hi, reg[0], reg[2]))
             else:
                 dr = default_reads(tree, rng, ln, o, w, c0, c1)
                 imp = set(m["imp"].get(path, ()))
@@ -413,6 +417,8 @@ def select(path, hunks, m, every):
                 got |= {t for sid in set(fm.values()) for t in sets[sid]}
                 out |= got or every
                 why.append("imp")
+        if why and set(why) == {"rt"}:
+            RT[path] = rts
         return out, "+".join(sorted(set(why)))
     if path in m["fixtures"]:
         return set(sets[m["fixtures"][path]]), "fixture"
@@ -481,15 +487,19 @@ def gateable(num, files, sel):
     return all((GATE.fullmatch(p) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
-def unchanged(name, patch):
+def unchanged(name, patch, files=()):
     """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
     that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
     left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
     if left < 10:
         return False
     try:
+        env = None
+        py = [p for p in files if p.endswith(".py")]
+        if name == "tpcds" and py and all(RT.get(p) is not None for p in py):  # only the queries these edits can reach
+            env = dict(os.environ, GATE_LINES=json.dumps({p: RT[p] for p in py}))
         r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
-                           timeout=min(45, left))
+                           timeout=min(45, left), env=env)
         got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
         return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
                 and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
@@ -624,6 +634,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         files.setdefault(b, [])  # binary, rename or mode-only: no hunks, still a changed file
     new = set(NEW.findall(text))
     chosen, whys, sel = set(), [], {}
+    RT.clear()
     for path, hunks in files.items():
         got = None
         if path in new and not (SRC / path).exists():
@@ -644,7 +655,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         sel[path] = got
         chosen |= every if got is None else got
     for num, name in gated.items():
-        if num in chosen and gateable(num, files, sel) and unchanged(name, patch):
+        if num in chosen and gateable(num, files, sel) and unchanged(name, patch, files):
             chosen.discard(num)
             whys.append(f"{name}-gate")
     if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)

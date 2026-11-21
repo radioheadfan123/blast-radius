@@ -15,6 +15,13 @@ import patchutil as pu  # noqa: E402
 SRC = os.environ.get("SQLGLOT_SRC", "/opt/sqlglot")
 ROWS = int(os.environ.get("GATE_ROWS", 200))  # rows read per table: enough for scans and filters to return rows
 BUDGET = float(os.environ.get("GATE_BUDGET", 6))  # full-data re-runs cost CPU; past this the test is just kept
+COV = os.environ.get("GATE_COV")  # build: write map/tpcds.cov, the sqlglot lines each query runs from a cold start
+hit = set()
+if COV:
+    M = sys.monitoring
+    M.use_tool_id(M.COVERAGE_ID, "tpcds-cov")
+    M.register_callback(M.COVERAGE_ID, M.events.LINE, lambda c, ln: (hit.add((c.co_filename, ln)), M.DISABLE)[1])
+    M.set_events(M.COVERAGE_ID, M.events.LINE)
 pu.overlay(sys.argv[1] if len(sys.argv) > 1 else None, SRC)
 import unittest  # noqa: E402,F401  sqlglot validates node args only under tests (expressions/core.py UNITTEST)
 
@@ -100,8 +107,8 @@ pfull = dict(ln.split(None, 1) for ln in open(os.path.join(MAP, "tpcds.full")).r
 if patched and (const != want[0] or not pfull):
     print("diff")
     sys.exit()
-pieces, fulls, spent, budget = [const], [], 0.0, 0.0
-for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")):
+def query(meta, sql):
+    """One query as the test handles it; (parsed expression, digest piece)."""
     out.clear(), code.clear()
     e = None
     try:
@@ -109,10 +116,77 @@ for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-
         out.append("parsed")
         if meta.get("execute"):  # what mp_execute does
             res = ex.execute(e, schema=TPCDS_SCHEMA, tables={t.name: tables[t.name] for t in find_tables(e)})
-            out += [repr(res.columns), repr(res.rows), transpile(sql, write="duckdb")[0]]
+            out.extend([repr(res.columns), repr(res.rows), transpile(sql, write="duckdb")[0]])
     except Exception as x:  # noqa
-        out += ["ERR", type(x).__name__]
-    piece = hashlib.md5("\n".join(out + sorted(code)).encode()).hexdigest()[:8]
+        out.extend(["ERR", type(x).__name__])
+    return e, hashlib.md5("\n".join(out + sorted(code)).encode()).hexdigest()[:8]
+
+
+QUERIES = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+if COV:  # each query in a fork of this process, so it runs cold, as in a fresh test worker, and caches cannot hide a line
+    import json
+    rel = lambda f: os.path.relpath(f, SRC)  # noqa: E731
+    cov = {"g": {}, "q": {}}
+    for f, ln in list(hit):  # ran at import or setup: an edit here can change every query
+        cov["g"].setdefault(rel(f), []).append(ln)
+    for i, (meta, sql, _) in enumerate(QUERIES):
+        r, w = os.pipe()
+        if os.fork() == 0:
+            os.close(r)
+            hit.clear(), M.restart_events()
+            query(meta, sql)
+            M.set_events(M.COVERAGE_ID, 0)
+            os.write(w, json.dumps(sorted(hit)).encode())
+            os._exit(0)
+        os.close(w)
+        data = b""
+        while chunk := os.read(r, 1 << 16):
+            data += chunk
+        os.close(r)
+        if os.wait()[1] or not data:
+            sys.exit("cov: query %d failed" % i)
+        for f, ln in json.loads(data):
+            cov["q"].setdefault(rel(f), {}).setdefault(str(ln), []).append(i)
+    keep = lambda d: {k: v for k, v in d.items() if k.startswith("sqlglot/")}  # noqa: E731
+    open(os.path.join(MAP, "tpcds.cov"), "w").write(json.dumps({"g": keep(cov["g"]), "q": keep(cov["q"]), "n": i + 1}))
+    sys.exit()
+
+
+def only():
+    """The queries a patch can change, from GATE_LINES ({file: [[lo, hi, body_lo, body_hi], ...]}, call-time edits
+    only, as the selector found them) and map/tpcds.cov; None (check every query) when any edit could reach them all."""
+    import json
+    lines = json.loads(os.environ["GATE_LINES"])
+    cov = json.load(open(os.path.join(MAP, "tpcds.cov")))
+    if cov["n"] != len(QUERIES):
+        return None
+    qs = set()
+    for path, eds in lines.items():
+        g, q = set(cov["g"].get(path, ())), cov["q"].get(path, {})
+        for lo, hi, blo, bhi in eds:
+            for a, b in ((lo, hi), (blo, bhi)):  # the edited statement; if no query ran it, its whole function
+                if g & set(range(a, b + 1)):
+                    return None
+                got = {i for ln in range(a, b + 1) for i in q.get(str(ln), ())}
+                if got:
+                    qs |= got
+                    break
+            else:
+                return None  # no query runs this function: check them all
+    return qs
+
+
+try:
+    ONLY = only() if patched and os.environ.get("GATE_LINES") else None
+except Exception as x:  # noqa: no map, bad input: check every query
+    print("only error", repr(x), file=sys.stderr)
+    ONLY = None
+print("only", None if ONLY is None else sorted(ONLY), file=sys.stderr)  # for tools
+pieces, fulls, spent, budget = [const], [], 0.0, 0.0
+for i, (meta, sql, _) in enumerate(QUERIES):
+    if ONLY is not None and i not in ONLY:
+        continue  # runs no edited line: its piece is the pristine one
+    e, piece = query(meta, sql)
     pieces.append(piece)
     if not meta.get("execute"):
         if patched and piece != (want[i + 1] if i + 1 < len(want) else None):

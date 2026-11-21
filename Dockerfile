@@ -9,6 +9,8 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests || true
 COPY selector.py patchutil.py tpcdsgate.py nodesgate.py gengate.py runtests.py /app/
 COPY map /app/map
 RUN python /app/tpcdsgate.py > /app/map/tpcds.md5 || echo none > /app/map/tpcds.md5  # no digest: never skip
+# the lines each TPC-DS query runs, on this python; no map: the gate checks every query
+RUN GATE_COV=1 python /app/tpcdsgate.py || rm -f /app/map/tpcds.cov
 RUN python /app/nodesgate.py > /app/map/nodes.md5 || echo none > /app/map/nodes.md5
 RUN python /app/gengate.py > /app/map/gen.md5 || echo none > /app/map/gen.md5
 ENV PYTHONDONTWRITEBYTECODE=1
