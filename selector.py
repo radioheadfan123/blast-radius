@@ -11,6 +11,8 @@ from pathlib import Path
 
 import patchutil as pu
 
+CLS_HDR = re.compile(r"^\s*(class\s|@)|_sql_names")
+
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 HERE = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))  # pristine checkout at the pinned commit
@@ -394,6 +396,12 @@ def select(path, hunks, m, every):
                     why.append("dflt")
                     continue
                 ca = class_at(tree, ln) if path.startswith("sqlglot/expressions/") else None
+                if ca and (lo <= ca[1] <= hi or any(t is not None and CLS_HDR.search(t) for t in (o, w))):
+                    # class header, class added or deleted, or _sql_names: other modules read these at import
+                    # (parser.py builds FUNCTIONS from sql_names()), so a break can fail every test
+                    out |= every
+                    why.append("imp")
+                    continue
                 key = ca and path[:-3].replace("/", ".") + "." + ca[0]
                 if key and key in m["cls"]:
                     # class-level edit of an expression class: tests that built it (or a subclass), or ran its code
@@ -536,9 +544,12 @@ def lazy_ok(patch):
     if patch not in _lazy:
         code = ("import sys; sys.path.insert(0, sys.argv[1]); import patchutil as pu; pu.overlay(sys.argv[2], sys.argv[3]); "
                 "import sqlglot; print(len(sqlglot.Dialect._classes))")
+        left = 100 - (time.monotonic() - START)  # same batch budget as the gates; False keeps test_lazy_load
         try:
+            if left < 10:
+                raise TimeoutError
             r = subprocess.run([sys.executable, "-c", code, str(HERE), str(patch), str(SRC)], capture_output=True,
-                               text=True, timeout=30)
+                               text=True, timeout=min(30, left))
             _lazy[patch] = r.returncode == 0 and r.stdout.split() == ["1"]
         except Exception:  # noqa: timeout
             _lazy[patch] = False
