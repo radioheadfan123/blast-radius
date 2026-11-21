@@ -101,6 +101,31 @@ def runtime(regs, ln, c0, c1):
     return best
 
 
+def default_reads(tree, rng, ln, o, w, c0, c1):
+    """Line spans in the top-level def whose one-line literal default holds the edit (and stays a literal)
+    that read that parameter; the whole body if it calls locals()/vars(). None if no such default.
+    Defaults are built once at import, but only a statement reading the parameter can see the value."""
+    if o is None or w is None or not (o.isascii() and w.isascii()):
+        return None
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = n.args
+            pos = a.posonlyargs + a.args
+            pairs = list(zip(pos[len(pos) - len(a.defaults):], a.defaults)) + list(zip(a.kwonlyargs, a.kw_defaults))
+            for arg, d in pairs:
+                if d and d.lineno == d.end_lineno == ln and d.col_offset <= c0 and c1 <= d.end_col_offset:
+                    try:
+                        ast.literal_eval(o[d.col_offset:d.end_col_offset])
+                        ast.literal_eval(w[d.col_offset:d.end_col_offset + len(w) - len(o)])
+                    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                        return None
+                    names = [x for s in n.body for x in ast.walk(s) if isinstance(x, ast.Name)]
+                    if any(x.id in ("locals", "vars") for x in names):
+                        return [(n.body[0].lineno, n.end_lineno)]
+                    return [rng.get(x.lineno, (x.lineno, x.end_lineno)) for x in names if x.id == arg.arg]
+    return None
+
+
 def class_at(tree, ln):
     """Qualified name and line span of the innermost class whose body holds line ln."""
     best, stack = None, [(tree, "")]
@@ -192,10 +217,12 @@ def same_meaning(old, new):
     return ast.dump(ta) == ast.dump(tb) and b.mixin_is <= a.mixin_is
 
 
-def readers(name, m):
-    """Tests that ran a line reading `name` at call time; None if anything reads it at import time."""
+def readers(name, m, attr_ok=False):
+    """Tests that ran a line reading `name` at call time; None if anything reads it at import time.
+    attr_ok: import-time `.name` reads are known to hit other classes' copies, only bare-word reads count."""
     sources()
     word = re.compile(r"\b%s\b" % re.escape(name))
+    bare = re.compile(r"(?<!\.)\b%s\b" % re.escape(name))
     define = re.compile(r"^\s*%s\s*(:[^=]*)?=[^=]" % re.escape(name))
     out = set()
     for rel, text in _src.items():
@@ -208,10 +235,22 @@ def readers(name, m):
             if not word.search(line) or define.match(line) or line.lstrip().startswith("#"):
                 continue
             lo, hi = _rng[rel].get(i, (i, i))
-            if any(l in imp for l in range(lo, hi + 1)):
+            if any(l in imp for l in range(lo, hi + 1)) and (not attr_ok or bare.search(line)):
                 return None
             out |= tests_in(fm, m["sets"], lo, hi)
     return out
+
+
+_impread = []
+
+
+def read_at_import(key, name):
+    """True if import or test collection read attribute `name` through class `key` (module.Qualname)."""
+    if not _impread:
+        p = HERE / "map" / "impread.json"
+        _impread.append(set(json.loads(p.read_text())) if p.is_file() else None)
+    s = _impread[0]
+    return s is None or key + "." + name in s or "*." + name in s
 
 
 def tests_in(fm, sets, lo, hi):
@@ -220,6 +259,14 @@ def tests_in(fm, sets, lo, hi):
         if str(ln) in fm:
             out.update(sets[fm[str(ln)]])
     return out
+
+
+def undoc(tree):
+    """Blank every bare string statement in place: docstrings, and attribute notes that Python just drops."""
+    for s in ast.walk(tree):
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+            s.value.value = ""
+    return tree
 
 
 def same_code(path, hunks):
@@ -235,10 +282,65 @@ def same_code(path, hunks):
     if [l for l in head(new) if "coding" in l] == [l for l in head(old) if "coding" in l]:
         if ast.dump(tree) == ast.dump(nt):
             return tree, "same"
+        # docstrings only: no listed test reads them (tests/test_docs.py uses load_tests, which pytest skips)
+        if path.startswith("sqlglot/") and ast.dump(undoc(tree)) == ast.dump(undoc(nt)):
+            return tree, "same"
         swap = any(t != " " and re.search(r"\bis\b", l) for _, body in hunks for t, l in body)
         if swap and path.startswith("sqlglot/") and same_meaning(old, new):
             return tree, "same-meaning"
     return tree, "changed"
+
+
+_tbf = {}
+IMPORT = re.compile(r"^\s*(?:from (tests(?:\.\w+)*) import\s*\(?\s*(\w*)|import (tests(?:\.\w+)+))", re.M)
+
+
+def blank_tests(tree):
+    """{(class, name): dump} of every test* def directly in the module or a class body, then blank them in place."""
+    out = {}
+    for c in [tree] + [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        for s in c.body:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name.startswith("test"):
+                out[(getattr(c, "name", ""), s.name)] = ast.dump(s)
+                s.body, s.decorator_list, s.returns = [ast.Pass()], [], None
+                s.args = ast.arguments([], [], None, [], [], None, [])
+    return out
+
+
+def test_module(path, hunks, broken):
+    """Edit to a test module: tests of that module and of every test module importing it (transitively);
+    only the edited test* defs when nothing else changed and nothing else names them."""
+    if not _tbf:
+        for t in json.loads((DATA / "tests.json").read_text())["tests"]:
+            _tbf.setdefault(t["file"], []).append((t["number"], t["id"].rsplit("::", 1)[-1]))
+    if path.endswith("/__init__.py"):  # package init runs before every module under it
+        d = path[: -len("__init__.py")]
+        return {n for f, ts in _tbf.items() if f.startswith(d) for n, _ in ts}
+    texts = {str(p.relative_to(SRC)): p.read_text() for p in SRC.glob("tests/**/*.py")}
+    imps = {}
+    for f, tx in texts.items():
+        for a, b, c in IMPORT.findall(tx):
+            mod = (a or c).replace(".", "/")
+            imps.setdefault(f, set()).update({mod + ".py", mod + "/" + b + ".py"} if b else {mod + ".py"})
+    mods, grew = {path}, True
+    while grew:
+        new = {f for f, s in imps.items() if s & mods} - mods
+        grew, mods = bool(new), mods | new
+    whole = {n for f in mods for n, _ in _tbf.get(f, ())}
+    if broken:
+        return whole
+    old = texts[path]
+    a, b = ast.parse(old), ast.parse("\n".join(pu.apply(old.splitlines(), hunks)) + "\n")
+    da, db = blank_tests(a), blank_tests(b)
+    if ast.dump(a) != ast.dump(b):
+        return whole
+    names = {k[1] for k in da if da[k] != db[k]}
+    for nm in names:
+        ref = re.compile(r"\b%s\b" % re.escape(nm))
+        if any(ref.search(l) and not re.match(r"\s*(async\s+)?def %s\b" % re.escape(nm), l)
+               for f in mods for l in texts[f].splitlines()):
+            return whole
+    return {n for f in mods for n, t in _tbf.get(f, ()) if t.split("[")[0] in names}
 
 
 def select(path, hunks, m, every):
@@ -249,6 +351,8 @@ def select(path, hunks, m, every):
             return set(), "same-ast"
         if verdict == "same-meaning":
             return set(), "same-meaning"
+        if path.startswith("tests/") and path not in m["fixtures"]:
+            return test_module(path, hunks, verdict == "broken"), "test"
         if verdict == "broken":
             return None, "broken"
     if path.startswith("sqlglot/") and path.endswith(".py") and (SRC / path).is_file():
@@ -266,6 +370,14 @@ def select(path, hunks, m, every):
                 out |= got
                 why.append("rt")
             else:
+                dr = default_reads(tree, rng, ln, o, w, c0, c1)
+                imp = set(m["imp"].get(path, ()))
+                if dr is not None and not any(set(range(lo, hi + 1)) & imp for lo, hi in dr):
+                    # default argument, read only at call time: tests that ran a statement reading it
+                    for lo, hi in dr:
+                        out |= tests_in(fm, sets, lo, hi)
+                    why.append("dflt")
+                    continue
                 ca = class_at(tree, ln) if path.startswith("sqlglot/expressions/") else None
                 key = ca and path[:-3].replace("/", ".") + "." + ca[0]
                 if key and key in m["cls"]:
@@ -276,6 +388,12 @@ def select(path, hunks, m, every):
                 got = set(sets[m["mod"][path]]) if path in m["mod"] else set()
                 name = class_setting(tree, ln) if o is not None and w is not None else None
                 rd = readers(name, m) if name and got else None
+                if rd is None and name and got:
+                    cq = class_at(tree, ln)
+                    mod = path[:-3].replace("/", ".").removesuffix(".__init__")
+                    # TRANSFORMS feeds generator._DISPATCH_CACHE, built once per class per process: coverage misses later readers
+                    if cq and name != "TRANSFORMS" and not read_at_import(mod + "." + cq[0], name):
+                        rd = readers(name, m, attr_ok=True)
                 if rd is not None:
                     # class setting read only at call time: tests that read it while using this module's dialect
                     out |= rd & got
