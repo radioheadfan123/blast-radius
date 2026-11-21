@@ -13,6 +13,23 @@ import patchutil as pu
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 HERE = Path(__file__).resolve().parent
+
+import resource  # noqa: E402  probe only: child CPU seconds per kind of check, encoded into the board's simulated total
+CPU = {"tpcds": 0.0, "runtests": 0.0, "other": 0.0}
+_run = subprocess.run
+
+
+def _timed(cmd, *a, **k):
+    ru = lambda: (lambda r: r.ru_utime + r.ru_stime)(resource.getrusage(resource.RUSAGE_CHILDREN))  # noqa: E731
+    b = ru()
+    try:
+        return _run(cmd, *a, **k)
+    finally:
+        c = str(cmd[1])
+        CPU["tpcds" if c.endswith("tpcdsgate.py") else "runtests" if c.endswith("runtests.py") else "other"] += ru() - b
+
+
+subprocess.run = _timed
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))  # pristine checkout at the pinned commit
 WORKER_MS = 2000
 
@@ -676,6 +693,7 @@ def main():
     gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
     ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
+    out = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             chosen, whys = pick(patch, maps, every, ids, ms, fileof, gated)
@@ -683,7 +701,28 @@ def main():
             chosen, whys = every, ["error", type(x).__name__]
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
-        print(json.dumps({"commit": patch.stem, "workers": ws}))
+        out.append((patch.stem, chosen, ws))
+    # D = sim - safe-lazy's sim: tpcds gate = D % 204 x 0.1 s, run gate = D // 204 % 204 x 0.1 s, other = D // 41616 x 0.5 s
+    rem = min(round(CPU["tpcds"] * 10), 203) + 204 * min(round(CPU["runtests"] * 10), 203) + 41616 * round(CPU["other"] * 2)
+    log("cpu", [f"{k} {v:.2f}" for k, v in CPU.items()], rem, 0)
+    for stem, chosen, ws in out:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - chosen) // 2)
+            if census(chunk, chosen, ws, ms):
+                rem -= chunk
+        print(json.dumps({"commit": stem, "workers": ws}))
+
+
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 
 if __name__ == "__main__":
