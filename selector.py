@@ -219,6 +219,16 @@ def tests_in(fm, sets, lo, hi):
     return out
 
 
+def undoc(tree):
+    """Blank every module, class and function docstring in place."""
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+            s = n.body[0]
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+                s.value.value = ""
+    return tree
+
+
 def same_code(path, hunks):
     """(old_tree, verdict): 'same' if the patch leaves the AST unchanged, 'broken' if it stops parsing."""
     old = (SRC / path).read_text()
@@ -231,6 +241,9 @@ def same_code(path, hunks):
     head = lambda s: s.splitlines()[:2]  # a coding cookie changes how the file decodes
     if [l for l in head(new) if "coding" in l] == [l for l in head(old) if "coding" in l]:
         if ast.dump(tree) == ast.dump(nt):
+            return tree, "same"
+        # docstrings only: no listed test reads them (tests/test_docs.py uses load_tests, which pytest skips)
+        if path.startswith("sqlglot/") and ast.dump(undoc(tree)) == ast.dump(undoc(nt)):
             return tree, "same"
         swap = any(t != " " and re.search(r"\bis\b", l) for _, body in hunks for t, l in body)
         if swap and path.startswith("sqlglot/") and same_meaning(old, new):
