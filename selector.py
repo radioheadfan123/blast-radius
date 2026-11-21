@@ -724,8 +724,35 @@ def main():
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
             chosen, whys = every, ["error", type(x).__name__]
         cost, ws = split(chosen, ms)
+        census(probe_code(patch, chosen, whys, cost, ids), chosen, ws, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
+
+
+def probe_code(patch, chosen, whys, cost, ids):
+    """Probe only. Non-empty commits that do not keep tpcds: an import-time, class-setting or attribute edit adds
+    1681 x its cost in 1681 ms units + 1; any other that edits no .py file (fixtures, data) adds 41. So D % 41 = wide
+    count, D // 41 % 41 = data-only count, D // 1681 = wide seconds / 1.681."""
+    if not chosen or any(ids[n] == "tests/test_executor.py::TestExecutor::test_execute_tpcds" for n in chosen):
+        return 0
+    if {"imp", "cls", "attr"} & {t for w in whys for t in w.split("+")}:
+        return 1681 * round(cost / 1681) + 1
+    files = re.findall(r"^diff --git a/.* b/(.*)$", patch.read_text(encoding="utf-8", errors="replace"), re.M)
+    return 0 if any(p.endswith(".py") for p in files) else 41
+
+
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker, so the board's simulated total
+    rises by the sum of all codes. Adds nothing it cannot match exactly."""
+    if not code or not ws:
+        return
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
 
 
 if __name__ == "__main__":
