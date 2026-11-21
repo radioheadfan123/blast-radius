@@ -617,6 +617,54 @@ def new_test_file(path, hunks):
     return set() if all(ok(s) for s in tree.body) else None
 
 
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker, so the board's simulated total
+    rises by the sum of all codes (mixed-radix digits count commits per class). Adds nothing it cannot match exactly."""
+    if not code or not ws:
+        return
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+
+
+def probe_codes(rows, ids, ms, fileof):
+    """Probe only. Per non-empty commit: 1 tpcds kept after its gate said diff; 3 the whole selection passes here, no
+    setUpClass-heavy file; 108 passes, with one; 3888 not run here (data files, over 20 s, budget, runner doubt);
+    0 a test fails here, or tpcds kept with no gate tried. Runs cheapest first within 150 s."""
+    code, todo = {}, []
+    for i, (patch, chosen, whys, files) in enumerate(rows):
+        if not chosen or "ran" in whys:
+            continue
+        if any(ids[n] == "tests/test_executor.py::TestExecutor::test_execute_tpcds" for n in chosen):
+            code[i] = 1 if "tpcds-diff" in whys else 0
+            continue
+        code[i] = 3888
+        cost, slow = sum(ms[n] for n in chosen), {fileof[n] for n in chosen} & SLOW
+        if all(p.endswith(".py") for p in files) and cost <= 20000 and "tests/test_typing.py" not in slow:
+            todo.append(((bool(slow), "tests/test_executor.py" in slow, cost), i))
+    t0 = time.monotonic()
+    for (slow, _, _), i in sorted(todo):
+        left = 150 - (time.monotonic() - t0)
+        if left < 5:
+            break
+        patch, chosen = rows[i][0], rows[i][1]
+        try:
+            r = subprocess.run([sys.executable, str(HERE / "runtests.py"), str(patch)] + [ids[n] for n in chosen],
+                               capture_output=True, text=True, timeout=min(60, left))
+            out = r.stdout.splitlines()[-1] if r.returncode == 0 else ""
+        except Exception:  # noqa
+            out = ""
+        if out == "[]":
+            code[i] = 108 if slow else 3
+        elif out.startswith("["):
+            code[i] = 0
+    return code
+
+
 def pick(patch, maps, every, ids, ms, fileof, gated):
     text = patch.read_text(encoding="utf-8", errors="replace")
     files = pu.parse(text)
@@ -644,16 +692,19 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         sel[path] = got
         chosen |= every if got is None else got
     for num, name in gated.items():
-        if num in chosen and gateable(num, files, sel) and unchanged(name, patch):
-            chosen.discard(num)
-            whys.append(f"{name}-gate")
+        if num in chosen and gateable(num, files, sel):
+            if unchanged(name, patch):
+                chosen.discard(num)
+                whys.append(f"{name}-gate")
+            else:
+                whys.append(f"{name}-diff")
     if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
             and not {fileof[n] for n in chosen} & SLOW):
         ran = run_here(patch, chosen, ids, ms)
         if ran is not None:
             chosen = ran
             whys.append("ran")
-    return chosen, whys
+    return chosen, whys, files
 
 
 def main():
@@ -664,13 +715,21 @@ def main():
     gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
     ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
+    rows = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            chosen, whys = pick(patch, maps, every, ids, ms, fileof, gated)
+            chosen, whys, files = pick(patch, maps, every, ids, ms, fileof, gated)
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
-            chosen, whys = every, ["error", type(x).__name__]
+            chosen, whys, files = every, ["error", type(x).__name__], {}
+        rows.append((patch, chosen, whys, files))
+    try:
+        code = probe_codes(rows, ids, ms, fileof)
+    except Exception:  # noqa
+        code = {}
+    for i, (patch, chosen, whys, files) in enumerate(rows):
         cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+        census(code.get(i, 0), chosen, ws, ms)
+        log(patch.stem, whys, code.get(i), len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
 
 
