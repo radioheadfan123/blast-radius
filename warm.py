@@ -20,6 +20,34 @@ def prime():
                 pass
 
 
+class _Lazy(cf.Future):
+    """A done future whose call runs when its result is first read, so a test that stops at its first failing case
+    never computes the rest (wait and as_completed only look at the state)."""
+
+    def __init__(self, fn, a, k):
+        super().__init__()
+        self._state, self._call = cf._base.FINISHED, (fn, a, k)
+
+    def _go(self):
+        if self._call:
+            fn, a, k = self._call
+            self._call = None
+            try:  # real pools pickle both ways; sqlglot's serde runs there
+                self._result = pickle.loads(pickle.dumps(fn(*a, **k)))
+            except KeyboardInterrupt:  # the run's timeout
+                raise
+            except BaseException as e:  # noqa
+                self._exception = e
+
+    def result(self, timeout=None):
+        self._go()
+        return super().result(timeout)
+
+    def exception(self, timeout=None):
+        self._go()
+        return super().exception(timeout)
+
+
 class _Inline(cf.Executor):
     """Process pools run in the child: spawned workers would import the pinned tree, not the patched one."""
 
@@ -28,13 +56,13 @@ class _Inline(cf.Executor):
             initializer(*initargs)
 
     def submit(self, fn, *a, **k):
-        f = cf.Future()
-        try:  # real pools pickle both ways; sqlglot's serde runs there
-            a, k = pickle.loads(pickle.dumps((a, k)))
-            f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+        try:
+            a, k = pickle.loads(pickle.dumps((a, k)))  # the arguments as they are now, as a real pool sends them
         except BaseException as e:  # noqa
+            f = cf.Future()
             f.set_exception(e)
-        return f
+            return f
+        return _Lazy(fn, a, k)
 
 
 def _eq(self, first, second, msg=None):
