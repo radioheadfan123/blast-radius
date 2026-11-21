@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import patchutil as pu
@@ -430,12 +431,22 @@ def split(nums, ms):
 GATE = re.compile(r"sqlglot/(parser|parsers/(?!__init__)\w+|optimizer/(?!__init__|scope\b)\w+|generators/duckdb|dialects/duckdb)\.py")
 
 
+START = time.monotonic()
+
+
 def tpcds_unchanged(patch, files):
     """True when tpcdsgate.py digests the patched tree the same as the pinned one, so test_execute_tpcds cannot break."""
     if not files or not all(GATE.fullmatch(p) for p in files):
         return False
-    r = subprocess.run([sys.executable, str(HERE / "tpcdsgate.py"), str(patch)], capture_output=True, text=True, timeout=120)
-    return r.returncode == 0 and r.stdout.split()[-1:] == (HERE / "map" / "tpcds.md5").read_text().split()
+    left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
+    if left < 10:
+        return False
+    try:
+        r = subprocess.run([sys.executable, str(HERE / "tpcdsgate.py"), str(patch)], capture_output=True, text=True,
+                           timeout=min(30, left))
+        return r.returncode == 0 and r.stdout.split()[-1:] == (HERE / "map" / "tpcds.md5").read_text().split()
+    except Exception:  # noqa: timeout, missing digest
+        return False
 
 
 def main():
