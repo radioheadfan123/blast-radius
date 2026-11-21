@@ -97,10 +97,6 @@ def runtime(regs, ln, c0, c1):
     return best
 
 
-def is_comment_only(changes):
-    return all(t.strip() == "" or t.strip().startswith("#") for _, t in changes)
-
-
 def class_at(tree, ln):
     """Qualified name and line span of the innermost class whose body holds line ln."""
     best, stack = None, [(tree, "")]
@@ -123,14 +119,31 @@ def tests_in(fm, sets, lo, hi):
     return out
 
 
+def same_code(path, hunks):
+    """(old_tree, verdict): 'same' if the patch leaves the AST unchanged, 'broken' if it stops parsing."""
+    old = (SRC / path).read_text()
+    tree = ast.parse(old)
+    new = "\n".join(pu.apply(old.splitlines(), hunks)) + "\n"
+    try:
+        nt = ast.parse(new)
+    except SyntaxError:
+        return tree, "broken"
+    head = lambda s: s.splitlines()[:2]  # a coding cookie changes how the file decodes
+    if ast.dump(tree) == ast.dump(nt) and [l for l in head(new) if "coding" in l] == [l for l in head(old) if "coding" in l]:
+        return tree, "same"
+    return tree, "changed"
+
+
 def select(path, hunks, m, every):
     sets = m["sets"]
-    changes = pu.changed_lines(hunks)
-    if path.endswith(".py") and is_comment_only(changes):
-        return set(), "comment"
-    if path.startswith("sqlglot/") and path.endswith(".py"):
+    if path.endswith(".py") and (SRC / path).is_file():
+        tree, verdict = same_code(path, hunks)
+        if verdict == "same":
+            return set(), "same-ast"
+        if verdict == "broken":
+            return None, "broken"
+    if path.startswith("sqlglot/") and path.endswith(".py") and (SRC / path).is_file():
         fm = m["files"].get(path, {})
-        tree = ast.parse((SRC / path).read_text())
         regs, rng = regions(tree), stmt_range(tree)
         out, why = set(), []
         for ln, o, w in edits(hunks):
