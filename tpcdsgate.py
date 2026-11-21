@@ -122,7 +122,7 @@ for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-
     if not patched:
         big = big or pickle.loads(pickle.dumps(load(None)))
         fulls.append("%d %s %.3f" % (i, *full_run(e, sql)))
-    elif piece != (want[i + 1] if i + 1 < len(want) else None):
+    elif os.environ.get("GATE_ALL") or piece != (want[i + 1] if i + 1 < len(want) else None):  # GATE_ALL: probe only
         try:
             gold, gold_t = pfull[str(i)].split()
             budget += float(gold_t)

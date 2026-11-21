@@ -632,36 +632,40 @@ def census(code, chosen, ws, ms):
 
 
 def probe_codes(rows, ids, ms, fileof):
-    """Probe only. Per non-empty commit: 1 tpcds kept after its gate said diff; 3 the whole selection passes here, no
-    setUpClass-heavy file; 108 passes, with one; 3888 not run here (data files, over 20 s, budget, runner doubt);
-    0 a test fails here, or tpcds kept with no gate tried. Runs cheapest first within 150 s."""
-    code, todo = {}, []
+    """Probe only. Per non-empty commit that keeps tpcds (its full check = tpcdsgate re-running every executed query on
+    the full tables): 1 gate said diff, full check passes; 3 no gate tried, passes, patch edits executor/; 9 no gate,
+    passes, no executor/ edit; 27 gate said diff, full check fails; 0 no gate, fails or not checked. Other non-empty
+    commits: 81 the whole selection passes here, no setUpClass-heavy file; 2916 passes, with one; 0 a test fails here,
+    ran here already, or not run (data files, over 20 s, budget). Cheapest runs first, 170 s in all."""
+    code, todo, t0 = {}, [], time.monotonic()
     for i, (patch, chosen, whys, files) in enumerate(rows):
         if not chosen or "ran" in whys:
             continue
         if any(ids[n] == "tests/test_executor.py::TestExecutor::test_execute_tpcds" for n in chosen):
-            code[i] = 1 if "tpcds-diff" in whys else 0
+            code[i] = 27 if "tpcds-diff" in whys else 0
+            todo.append(((0, 0, 0), i))
             continue
-        code[i] = 3888
         cost, slow = sum(ms[n] for n in chosen), {fileof[n] for n in chosen} & SLOW
         if all(p.endswith(".py") for p in files) and cost <= 20000 and "tests/test_typing.py" not in slow:
-            todo.append(((bool(slow), "tests/test_executor.py" in slow, cost), i))
-    t0 = time.monotonic()
-    for (slow, _, _), i in sorted(todo):
-        left = 150 - (time.monotonic() - t0)
+            todo.append(((1 + bool(slow), "tests/test_executor.py" in slow, cost), i))
+    for (kind, _, _), i in sorted(todo):
+        left = 170 - (time.monotonic() - t0)
         if left < 5:
             break
-        patch, chosen = rows[i][0], rows[i][1]
+        patch, chosen, whys = rows[i][:3]
         try:
+            if kind == 0:
+                r = subprocess.run([sys.executable, str(HERE / "tpcdsgate.py"), str(patch)], capture_output=True, text=True,
+                                   timeout=min(90, left), env={**os.environ, "GATE_ALL": "1", "GATE_BUDGET": "1e9"})
+                if r.returncode == 0 and r.stdout.split()[:1] == (HERE / "map" / "tpcds.md5").read_text().split()[:1]:
+                    code[i] = 1 if "tpcds-diff" in whys else 3 if any(p.startswith("sqlglot/executor/") for p in rows[i][3]) else 9
+                continue
             r = subprocess.run([sys.executable, str(HERE / "runtests.py"), str(patch)] + [ids[n] for n in chosen],
                                capture_output=True, text=True, timeout=min(60, left))
-            out = r.stdout.splitlines()[-1] if r.returncode == 0 else ""
+            if r.returncode == 0 and r.stdout.splitlines()[-1:] == ["[]"]:
+                code[i] = 2916 if kind == 2 else 81
         except Exception:  # noqa
-            out = ""
-        if out == "[]":
-            code[i] = 108 if slow else 3
-        elif out.startswith("["):
-            code[i] = 0
+            pass
     return code
 
 
