@@ -659,7 +659,8 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
             chosen.discard(num)
             whys.append(f"{name}-gate")
     if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
-            and not {fileof[n] for n in chosen} & SLOW):
+            and not {fileof[n] for n in chosen} & SLOW
+            and not any(ids[n].endswith("::test_lazy_load") for n in chosen)):  # its child python imports the pinned tree
         ran = run_here(patch, chosen, ids, ms)
         if ran is not None:
             chosen = ran
