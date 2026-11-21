@@ -482,10 +482,10 @@ def same_inputs(path, hunks):
 
 def gateable(num, files, sel, name=""):
     """The gate replays test num on the pinned fixtures, so every file the test reads must be a sqlglot module it can
-    import patched; data files the test never opens do not matter. The tpcds gate also takes call-time executor edits:
-    it re-runs on the full tables the queries that ran the edited lines there."""
+    import patched; data files the test never opens do not matter. The tpcds gate also takes executor edits: it
+    re-runs on the full tables the queries that ran the edited lines there, or every executed query."""
     # a .py file with no hunks was renamed or its mode changed: the gate cannot see that
-    exe = lambda p: name == "tpcds" and p.startswith("sqlglot/executor/") and p.endswith(".py") and RT.get(p) is not None  # noqa: E731
+    exe = lambda p: name == "tpcds" and p.startswith("sqlglot/executor/") and p.endswith(".py")  # noqa: E731
     return all(((GATE.fullmatch(p) or exe(p)) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 

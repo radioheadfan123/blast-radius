@@ -206,13 +206,17 @@ print("only", ONLY and [sorted(x) for x in ONLY], file=sys.stderr)  # for tools
 ONLY, FULL = ONLY or (None, set())
 if patched and (ONLY is None and any(p.startswith("sqlglot/executor/") for p in pu.parse(open(sys.argv[1]).read()))
                 or sum(float(pfull.get(str(i), "x 1e9").split()[1]) for i in FULL) > EXEC_BUDGET):
-    print("diff")  # an executor edit is checked only on the full tables, of the queries that run it
-    sys.exit()
+    # an executor edit the map cannot narrow: re-run every executed query on the full tables, as the test does
+    ONLY, FULL = None, {int(i) for i in pfull}
+    EXEC_BUDGET = sum(float(v.split()[1]) for v in pfull.values()) + 1
 pieces, fulls, spent, budget = [const], [], 0.0, 0.0
 for i, (meta, sql, _) in enumerate(QUERIES):
     if ONLY is not None and i not in ONLY | FULL:
         continue  # runs no edited line: its piece is the pristine one
-    e, piece = query(meta, sql)
+    if patched and i in FULL:  # re-run on the full tables below, which is all the test sees: skip the small tables
+        e, piece = pickle.loads(pickle.dumps(parse_one(sql))), None
+    else:
+        e, piece = query(meta, sql)
     pieces.append(piece)
     if not meta.get("execute"):
         if patched and piece != (want[i + 1] if i + 1 < len(want) else None):
