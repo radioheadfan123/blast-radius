@@ -56,6 +56,12 @@ for rel, ln in pool:
     got, why = S.select(rel, [(ln, [("-", old), ("+", new)])], m, every)
     if not set(why.split("+")) & kinds:
         continue
+    if "new" in kinds:  # only edits the import-read trace newly lets through
+        S._impread[:] = [None]
+        w0 = S.select(rel, [(ln, [("-", old), ("+", new)])], m, every)[1]
+        S._impread.clear()
+        if w0 == why:
+            continue
     got = every if got is None else got
     f = os.path.join(MUT, rel)
     open(f, "w").write("\n".join(lines[:ln - 1] + [new] + lines[ln:]))
