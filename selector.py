@@ -311,7 +311,7 @@ def split(nums, ms):
 
 # Each gate replays its test cheaply and digests all it builds (tpcdsgate.py runs every query through the executor on
 # small tables and re-runs on the full tables the few queries whose digest differs, nodesgate.py parses at 1/100
-# width), so any sqlglot file
+# width, gengate.py loops 1/10 as often), so any sqlglot file
 # but the executor's own (whose run-time behaviour only the full data shows) can be gated.
 GATE = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")
 
@@ -320,7 +320,8 @@ START = time.monotonic()
 
 
 GATES = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",  # test id -> <name>gate.py, map/<name>.md5
-         "tests/test_parser.py::TestParser::test_max_nodes": "nodes"}
+         "tests/test_parser.py::TestParser::test_max_nodes": "nodes",
+         "tests/test_generator.py::TestGenerator::test_generator_memory": "gen"}
 
 
 TPC = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
