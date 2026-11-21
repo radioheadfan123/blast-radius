@@ -367,8 +367,26 @@ def unchanged(name, patch):
         return False
 
 
+SLOW = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/test_lineage.py", "tests/test_sqlglotc.py"}  # setUpClass
+RUN_MS = 1500  # below this, running the tests here (about 0.4 s to start) beats the 2 s a worker costs when none fails
+
+
+def run_here(patch, nums, ids, ms):
+    """The tests among nums that fail when runtests.py runs them on the patched tree, or None to keep them all."""
+    if 100 - (time.monotonic() - START) < 20:
+        return None
+    try:
+        r = subprocess.run([sys.executable, str(HERE / "runtests.py"), str(patch)] + [ids[n] for n in nums],
+                           capture_output=True, text=True, timeout=3 * sum(ms[n] for n in nums) / 1000 + 3)
+        num = {ids[n]: n for n in nums}
+        return {num[i] for i in json.loads(r.stdout.splitlines()[-1])} if r.returncode == 0 else None
+    except Exception:  # noqa: timeout (pytest would time the test out too), fallback, a crash
+        return None
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    fileof = {t["number"]: t["file"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     every = set(ms)
     gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
@@ -390,6 +408,12 @@ def main():
             if num in chosen and gateable(num, files, sel) and unchanged(name, patch):
                 chosen.discard(num)
                 whys.append(f"{name}-gate")
+        if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
+                and not {fileof[n] for n in chosen} & SLOW):
+            ran = run_here(patch, chosen, ids, ms)
+            if ran is not None:
+                chosen = ran
+                whys.append("ran")
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
