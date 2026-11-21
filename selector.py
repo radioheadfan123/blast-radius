@@ -252,6 +252,8 @@ def main():
             got, why = select(path, hunks, maps, every)
             whys.append(why)
             chosen |= every if got is None else got
+        if set("+".join(whys).split("+")) - {"rt"}:  # PROBE: everything except pure in-function edits runs all tests
+            chosen = every
         cost, ws = split(chosen, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
