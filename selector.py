@@ -555,6 +555,68 @@ def new_module(path, ids):
     return {n for n, i in ids.items() if i.startswith(("tests/test_sqlglotc.py::", "tests/test_typing.py::"))}
 
 
+_test_text = []
+
+
+def new_test_file(path, hunks):
+    """set() for a brand-new file under tests/ that no pinned test can see, else None. Its own tests have no number,
+    and no test lists a directory, so it reaches others only by a name a pinned test already uses, or, for a module
+    pytest collects (one process for the whole run), by what importing it runs: so that must be only pinned imports and
+    plain class and function definitions."""
+    p = Path(path)
+    if not path.startswith("tests/") or p.name == "conftest.py" or not (SRC / p.parent / "__init__.py").is_file() \
+            and not path.startswith("tests/fixtures/"):
+        return None
+    if not (SRC / p.parent).is_dir():
+        return None
+    if not _test_text:
+        _test_text.append("\n".join(f.read_text(encoding="utf-8", errors="replace") for f in (SRC / "tests").rglob("*.py")))
+    if re.search(rf"\b{re.escape(p.stem)}\b", _test_text[0]):
+        return None  # a pinned test may open or import it by that name
+    if p.suffix != ".py" or not (p.name.startswith("test") or p.stem.endswith("_test")):
+        return set()  # data, or a module only an import by name would load
+    try:
+        tree = ast.parse("\n".join(pu.apply([], hunks)) + "\n")
+    except SyntaxError:
+        return None
+
+    def pinned(mod):
+        top = mod.split(".")[0]
+        if top in ("sqlglot", "tests"):
+            f = SRC / mod.replace(".", "/")
+            return f.with_suffix(".py").is_file() or (f / "__init__.py").is_file()
+        return top in sys.stdlib_module_names or top == "pytest"
+
+    def plain(d):  # skip marks, mock patches, classmethod: build a wrapper at import, touch no registry a pinned test reads
+        while isinstance(d, (ast.Call, ast.Attribute)):
+            d = d.func if isinstance(d, ast.Call) else d.value
+        return isinstance(d, ast.Name) and d.id in ("unittest", "pytest", "mock", "patch", "classmethod", "staticmethod",
+                                                    "property")
+
+    def const(v):
+        return isinstance(v, (ast.Constant, ast.Name, ast.Attribute)) or isinstance(v, (ast.Tuple, ast.List, ast.Set)) \
+            and all(const(e) for e in v.elts) or isinstance(v, ast.Dict) and all(const(e) for e in v.keys + v.values if e)
+
+    def ok(s):
+        if isinstance(s, ast.Import):
+            return all(pinned(a.name) for a in s.names)
+        if isinstance(s, ast.ImportFrom):
+            return s.level == 0 and pinned(s.module)
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return all(plain(d) for d in s.decorator_list)
+        if isinstance(s, ast.ClassDef):
+            return all(plain(d) for d in s.decorator_list) and all(ok(x) for x in s.body)
+        if isinstance(s, ast.Expr):
+            return isinstance(s.value, ast.Constant)
+        if isinstance(s, ast.Assign):
+            return all(isinstance(t, ast.Name) for t in s.targets) and const(s.value)
+        if isinstance(s, ast.If):  # if __name__ == "__main__": never runs under pytest
+            return ast.unparse(s.test).replace("'", '"') == '__name__ == "__main__"'
+        return isinstance(s, ast.Pass)
+
+    return set() if all(ok(s) for s in tree.body) else None
+
+
 def pick(patch, maps, every, ids, ms, fileof, gated):
     text = patch.read_text(encoding="utf-8", errors="replace")
     files = pu.parse(text)
@@ -563,7 +625,9 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
     new = set(NEW.findall(text))
     chosen, whys, sel = set(), [], {}
     for path, hunks in files.items():
-        got = new_module(path, ids) if path in new and not (SRC / path).exists() else None
+        got = None
+        if path in new and not (SRC / path).exists():
+            got = new_module(path, ids) if path.startswith("sqlglot/") else new_test_file(path, hunks)
         if got is not None:  # else fall through: the old rules still own every file the new rule does not claim
             why = "new"
         elif path.startswith("sqlglotc/"):  # only test_sqlglotc runs sqlglotc/setup.py; nothing else reads sqlglotc/
