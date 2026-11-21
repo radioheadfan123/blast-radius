@@ -469,6 +469,9 @@ def gateable(num, files, sel):
     return all(GATE.fullmatch(p) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
+REF = {}  # gate name -> pristine CPU seconds, the larger of the build's and one run here
+
+
 def unchanged(name, patch):
     """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
     that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
@@ -476,11 +479,17 @@ def unchanged(name, patch):
     if left < 10:
         return False
     try:
+        want = (HERE / "map" / f"{name}.md5").read_text().split()
+        if len(want) > 1 and name not in REF:  # CPU check: this machine may be slower than the one that built the map
+            REF[name] = float(want[1])
+            r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py")], capture_output=True, text=True,
+                               timeout=min(45, left))
+            REF[name] = max(REF[name], float(r.stdout.split()[1]))
         r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
                            timeout=min(45, left))
-        got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
+        got = r.stdout.split()
         return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
-                and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
+                and (len(got) < 2 or float(got[1]) <= 1.5 * REF[name] + 0.1))
     except Exception:  # noqa: timeout, missing digest
         return False
 
