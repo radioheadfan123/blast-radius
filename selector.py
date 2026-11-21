@@ -519,6 +519,20 @@ def run_here(patch, nums, ids, ms):
         return None
 
 
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker, so the board's simulated total
+    rises by the sum of all codes (mixed-radix digits count commits per class). Adds nothing it cannot match exactly."""
+    if not code or not ws:
+        return
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+
+
 def pick(patch, maps, every, ids, ms, fileof, gated):
     text = patch.read_text(encoding="utf-8", errors="replace")
     files = pu.parse(text)
@@ -561,6 +575,8 @@ def main():
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
             chosen, whys = every, ["error", type(x).__name__]
         cost, ws = split(chosen, ms)
+        kept = {name for num, name in gated.items() if num in chosen}
+        census(bool(chosen) + 41 * ("nodes" in kept) + 1681 * ("tpcds" in kept) + 18491 * ("gen" in kept), chosen, ws, ms)
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
 
