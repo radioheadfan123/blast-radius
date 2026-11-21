@@ -110,7 +110,7 @@ patched = len(sys.argv) > 1
 want = open(os.path.join(MAP, "tpcds.steps")).read().split() if patched else None
 pfull = dict(ln.split(None, 1) for ln in open(os.path.join(MAP, "tpcds.full")).read().splitlines()) if patched else {}
 if patched and (const != want[0] or not pfull):
-    print("diff")
+    print("diff4")
     sys.exit()
 def query(meta, sql):
     """One query as the test handles it; (parsed expression, digest piece)."""
@@ -206,7 +206,7 @@ print("only", ONLY and [sorted(x) for x in ONLY], file=sys.stderr)  # for tools
 ONLY, FULL = ONLY or (None, set())
 if patched and (ONLY is None and any(p.startswith("sqlglot/executor/") for p in pu.parse(open(sys.argv[1]).read()))
                 or sum(float(pfull.get(str(i), "x 1e9").split()[1]) for i in FULL) > EXEC_BUDGET):
-    print("diff")  # an executor edit is checked only on the full tables, of the queries that run it
+    print("diff3")  # an executor edit is checked only on the full tables, of the queries that run it
     sys.exit()
 pieces, fulls, spent, budget = [const], [], 0.0, 0.0
 for i, (meta, sql, _) in enumerate(QUERIES):
@@ -216,7 +216,7 @@ for i, (meta, sql, _) in enumerate(QUERIES):
     pieces.append(piece)
     if not meta.get("execute"):
         if patched and piece != (want[i + 1] if i + 1 < len(want) else None):
-            print("diff")
+            print("diff5")
             sys.exit()
         continue
     if not patched:
@@ -236,7 +236,7 @@ for i, (meta, sql, _) in enumerate(QUERIES):
             md5, gold = None, ""
         print("rerun", i, md5 == gold, file=sys.stderr)  # for tools/v3check.py
         if md5 != gold or spent > 2 * budget + 1:  # much slower can time the real test out
-            print("diff")
+            print("diff5")
             sys.exit()
 if not patched:
     try:

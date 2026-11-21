@@ -489,10 +489,14 @@ def gateable(num, files, sel, name=""):
     return all(((GATE.fullmatch(p) or exe(p)) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
+LAST, WHY_KEEP = {}, [7]  # probe only
+
+
 def unchanged(name, patch, files=()):
     """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
     that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
     left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
+    LAST[name] = "late"
     if left < 10:
         return False
     try:
@@ -503,6 +507,7 @@ def unchanged(name, patch, files=()):
         r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
                            timeout=min(45, left), env=env)
         got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
+        LAST[name] = got[0] if got else "late"
         return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
                 and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
     except Exception:  # noqa: timeout, missing digest
@@ -657,9 +662,17 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         sel[path] = got
         chosen |= every if got is None else got
     for num, name in gated.items():
-        if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
+        if name == "tpcds":
+            WHY_KEEP[0] = 7
+        g = num in chosen and gateable(num, files, sel, name)
+        if num in chosen and name == "tpcds" and not g:
+            WHY_KEEP[0] = 1 if any(p.startswith("sqlglot/executor/") and p.endswith(".py") and RT.get(p) is None
+                                   for p in files) else 2
+        if g and unchanged(name, patch, files):
             chosen.discard(num)
             whys.append(f"{name}-gate")
+        elif g and name == "tpcds":
+            WHY_KEEP[0] = {"diff3": 3, "diff4": 4, "diff5": 5, "late": 7}.get(LAST.get(name), 6)
     if (chosen and sum(ms[n] for n in chosen) <= RUN_MS and all(p.endswith(".py") for p in files)
             and not {fileof[n] for n in chosen} & SLOW):
         ran = run_here(patch, chosen, ids, ms)
@@ -677,14 +690,39 @@ def main():
     gated = {t["number"]: GATES[t["id"]] for t in tests if t["id"] in GATES}
     ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
+    tp = next(n for n, i in ids.items() if i == "tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    keeps = 0
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             chosen, whys = pick(patch, maps, every, ids, ms, fileof, gated)
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
             chosen, whys = every, ["error", type(x).__name__]
         cost, ws = split(chosen, ms)
+        if tp in chosen and keeps < 3:
+            text = patch.read_text(encoding="utf-8", errors="replace")
+            fs = re.findall(r"^diff --git a/.* b/(.*)$", text, re.M)
+            code = (WHY_KEEP[0] + 8 * any(p.startswith("sqlglot/executor/") and p.endswith(".py") for p in fs)
+                    + 16 * any(p.startswith("tests/") and p.endswith(".py") for p in fs) + 32 * any(not p.endswith(".py") for p in fs))
+            census(code * 64 ** keeps, chosen, ws, ms)
+            log("keep", keeps, code)
+            keeps += 1
         log(patch.stem, whys, len(chosen), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
+
+
+def census(code, chosen, ws, ms):
+    """Probe only. Each of the first 3 commits that keep test_execute_tpcds adds code x 64^k ms (k = its order), code =
+    why it was kept (1 an executor/ edit that is not call-time, 2 another file the gate cannot take, 3 gate refused up
+    front: no query map or over EXEC_BUDGET, 4 constants differ, 5 a query's digest or full-data re-run differs, 6 final
+    digest or CPU differs, 7 no time left, error or timeout) + 8 if it edits executor/ .py, + 16 if it edits tests/ .py,
+    + 32 if it edits any non-.py file. D = sim - exp-qexec's sim; code_k = D // 64^k % 64."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0 and ws:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
 
 
 if __name__ == "__main__":
