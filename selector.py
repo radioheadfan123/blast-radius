@@ -2,6 +2,7 @@
 import ast
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -111,6 +112,45 @@ def class_at(tree, ln):
     return best
 
 
+def class_setting(tree, ln):
+    """Name X if line ln sits in a plain `X = ...` statement directly in a class body."""
+    for c in ast.walk(tree):
+        if isinstance(c, ast.ClassDef):
+            for s in c.body:
+                if s.lineno <= ln <= s.end_lineno:
+                    tg = s.targets if isinstance(s, ast.Assign) else [s.target] if isinstance(s, ast.AnnAssign) else []
+                    if len(tg) == 1 and isinstance(tg[0], ast.Name):
+                        return tg[0].id
+    return None
+
+
+_src, _rng = {}, {}
+
+
+def readers(name, m):
+    """Tests that ran a line reading `name` at call time; None if anything reads it at import time."""
+    if not _src:
+        for p in SRC.glob("sqlglot/**/*.py"):
+            _src[str(p.relative_to(SRC))] = p.read_text()
+    word = re.compile(r"\b%s\b" % re.escape(name))
+    define = re.compile(r"^\s*%s\s*(:[^=]*)?=[^=]" % re.escape(name))
+    out = set()
+    for rel, text in _src.items():
+        if not word.search(text):
+            continue
+        if rel not in _rng:
+            _rng[rel] = stmt_range(ast.parse(text))
+        imp, fm = set(m["imp"].get(rel, ())), m["files"].get(rel, {})
+        for i, line in enumerate(text.splitlines(), 1):
+            if not word.search(line) or define.match(line) or line.lstrip().startswith("#"):
+                continue
+            lo, hi = _rng[rel].get(i, (i, i))
+            if any(l in imp for l in range(lo, hi + 1)):
+                return None
+            out |= tests_in(fm, m["sets"], lo, hi)
+    return out
+
+
 def tests_in(fm, sets, lo, hi):
     out = set()
     for ln in range(lo, hi + 1):
@@ -165,6 +205,13 @@ def select(path, hunks, m, every):
                     why.append("cls")
                     continue
                 got = set(sets[m["mod"][path]]) if path in m["mod"] else set()
+                name = class_setting(tree, ln) if o is not None and w is not None else None
+                rd = readers(name, m) if name and got else None
+                if rd is not None:
+                    # class setting read only at call time: tests that read it while using this module's dialect
+                    out |= rd & got
+                    why.append("attr")
+                    continue
                 got |= {t for sid in set(fm.values()) for t in sets[sid]}
                 out |= got or every
                 why.append("imp")
