@@ -31,6 +31,8 @@ def load_maps():
     m = json.loads((HERE / "map" / "lines.json").read_text())
     c = HERE / "map" / "col.json"  # sqlglot lines pytest collection ran, all of sqlglot already imported (colmap.py)
     m["col"] = json.loads(c.read_text()) if c.is_file() else None
+    t = HERE / "map" / "tmap.json"  # per generator class: tests that used it, looked a key up through it (tmap.py)
+    m["tmap"] = json.loads(t.read_text()) if t.is_file() else None
     return m
 
 
@@ -455,6 +457,100 @@ RESC = {}  # path -> coverage tests if its only import-time edits sit in functio
 # ponytail: a hand list of per-process caches filled at call time (generator.py's _DISPATCH_CACHE, once per class):
 # coverage credits only the first test per class, and the import snapshot holds only classes built at import
 NOCACHE = {"sqlglot/generator.py": {"_build_dispatch", "__init__"}}
+DECOS = ("unsupported_args", "generator.unsupported_args")  # wraps at import, always calls the function (generator.py:34)
+
+
+def added_defs(ntree, otree, new_lines, hunks):
+    """{new line: (class name or None, def node) or None} for the lines of defs the patch adds whole (decorators to last
+    line) to a top-level class the old tree has, or at module level; None marks an added blank or comment line outside
+    any string literal, which no test can see (not lines 1-2, a coding line; not a type comment)."""
+    new, out = set(inserted(hunks)), {}
+    oldc = {c.name for c in otree.body if isinstance(c, ast.ClassDef)}
+    for cname, body in [(None, ntree.body)] + [(c.name, c.body) for c in ntree.body if isinstance(c, ast.ClassDef) and c.name in oldc]:
+        for d in body:
+            if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                lo = min([d.lineno] + [x.lineno for x in d.decorator_list])
+                if all(k in new for k in range(lo, d.end_lineno + 1)):
+                    out.update(dict.fromkeys(range(lo, d.end_lineno + 1), (cname, d)))
+    strs = [(n.lineno, n.end_lineno) for n in ast.walk(ntree) if isinstance(n, (ast.Constant, ast.JoinedStr)) and n.end_lineno > n.lineno]
+    for k in new - set(out):
+        t = new_lines[k - 1].strip()
+        if k > 2 and (not t or t.startswith("#") and not t.startswith("# type:")) and not any(a <= k <= b for a, b in strs):
+            out[k] = None
+    return out
+
+
+def bound(st, name):
+    """A class-body statement binds or names `name` (anything but a def or an assignment: any mention counts)."""
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return st.name == name
+    ts = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else [st]
+    return any(isinstance(n, ast.Name) and n.id == name or isinstance(n, ast.alias) and name in (n.name, n.asname)
+               for t in ts for n in ast.walk(t))
+
+
+def newdef(path, ntree, cname, d, m):
+    """Tests a def the patch adds whole to sqlglot/generators/<d>.py can change, or None to fall back to an import edit.
+    Old code reaches a new method N of generator class L only by name, through an instance whose class has L in its MRO
+    (map/tmap.json "mro"): it ran an ancestor's N (tests that ran that body and used L: tmap "L|*" or the module's
+    dialect tests), or, N being <key>_sql, the dispatch (generator.py _build_dispatch adds <key>_sql methods by name)
+    and preprocess's getattr (transforms.py) looked that key up (tmap "L|key"). generator.py:4421's getattr needs an
+    ancestor's N. A new module-level function no pinned sqlglot line names is reached only by new code."""
+    T, N = m.get("tmap"), d.name
+    if T is None or not re.fullmatch(r"sqlglot/generators/\w+\.py", path):
+        return None
+    if any(ast.unparse(x.func if isinstance(x, ast.Call) else x) not in DECOS for x in d.decorator_list):
+        return None
+    try:  # decorator arguments and defaults run at import: literals only (annotations are lazy, __future__ in every file)
+        for x in [a for x in d.decorator_list if isinstance(x, ast.Call) for a in x.args + [k.value for k in x.keywords]] + \
+                d.args.defaults + [k for k in d.args.kw_defaults if k]:
+            ast.literal_eval(x)
+    except Exception:  # noqa
+        return None
+    if not any(isinstance(s, ast.ImportFrom) and s.module == "__future__" and "annotations" in [a.name for a in s.names] for s in ntree.body):
+        return None
+    if cname is None:
+        return None if N in pre().get("words", {N}) else set()
+    L = path[:-3].replace("/", ".") + "." + cname
+    mro = T["mro"].get(L)
+    if N.startswith("__") and N != "__init__" or not mro or mro[0] != L:
+        return None
+    cls = next(c for c in ntree.body if isinstance(c, ast.ClassDef) and c.name == cname)
+    for st in cls.body:  # a bare N at class level (a statement, a decorator, a default) now finds the new def
+        parts = [st] if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) else (
+            st.decorator_list + st.args.defaults + [x for x in st.args.kw_defaults if x])
+        if st is not d and any(isinstance(n, ast.Name) and n.id == N for p in parts for n in ast.walk(p)):
+            return None
+
+    def tm(k):
+        v = T["p"].get(f"{L}|{k}")
+        return set() if v is None else None if v == -1 else set(T["sets"][v])
+    used, got, anc, key = tm("*"), set(), False, N.endswith("_sql") and not N.startswith("_")
+    if used is None:  # a generator of L built or used outside a test (import, collection): may carry over
+        return None
+    if key:
+        g = tm(N[:-4])
+        if g is None:
+            return None
+        got |= g
+    uses = used | (set(m["sets"][m["mod"][path]]) if path in m["mod"] else set())
+    for a in mro[1:]:
+        mod, _, q = a.rpartition(".")
+        ap = mod.replace(".", "/") + ".py"
+        if ap not in sources():
+            return None
+        c = next((c for c in ast.parse(sources()[ap]).body if isinstance(c, ast.ClassDef) and c.name == q), None)
+        if c is None:
+            return None
+        for st in c.body:
+            if bound(st, N):
+                if not isinstance(st, ast.FunctionDef) or st.decorator_list or len(st.body) == 1 and isinstance(st.body[0], ast.Expr):
+                    return None  # (a docstring-only body leaves no line coverage can see)
+                got |= tests_in(m["files"].get(ap, {}), m["sets"], st.body[0].lineno, st.end_lineno) & uses
+                anc = True
+    if not anc and not key and N in pre().get("words", {N}):  # a new helper some old line names (hasattr, getattr default)
+        return None
+    return got
 
 
 def select(path, hunks, m, every):
@@ -477,15 +573,22 @@ def select(path, hunks, m, every):
         out, why, rts = set(), [], []
         resc, col = set(), m.get("col")
         col = None if col is None else set(col.get(path, ()))
-        ins, nregs = iter(inserted(hunks)), None
+        ins, nregs, adds, nds = iter(inserted(hunks)), None, None, {}
         for ln, o, w in edits(hunks):
+            mm = next(ins) if o is None else None
             c0, c1 = span(o, w)
             reg = runtime(regs, ln, c0, c1) if o is not None and w is not None else None
             lo, hi = rng.get(ln, (ln, ln))
             if o is None or w is None:  # a line added or removed outright: every test that ran the function it sits in
                 if o is None and nregs is None:
-                    nregs = regions(ast.parse("\n".join(pu.apply((SRC / path).read_text().splitlines(), hunks)) + "\n"))
-                reg = one_sided(regs, nregs, hunks, ln, o, w, next(ins) if o is None else None)
+                    nlines = pu.apply((SRC / path).read_text().splitlines(), hunks)
+                    ntree = ast.parse("\n".join(nlines) + "\n")
+                    nregs, adds = regions(ntree), added_defs(ntree, tree, nlines, hunks)
+                if o is None and mm in adds:  # part of a def the patch adds, or a blank / comment line: see newdef()
+                    if adds[mm] is not None:
+                        nds[id(adds[mm][1])] = adds[mm]
+                    continue
+                reg = one_sided(regs, nregs, hunks, ln, o, w, mm)
                 if reg:
                     lo, hi = reg[0], reg[2]
             if reg and set(range(lo, hi + 1)) & set(m["imp"].get(path, ())):
@@ -552,6 +655,16 @@ def select(path, hunks, m, every):
                 got |= {t for sid in set(fm.values()) for t in sets[sid]}
                 out |= got or every
                 why.append("imp")
+        for cname, d in nds.values():
+            got = newdef(path, ntree, cname, d, m)
+            if got is None:  # as an import edit (what one_sided gave a new def before)
+                got = (set(sets[m["mod"][path]]) if path in m["mod"] else set()) | {t for sid in set(fm.values()) for t in sets[sid]}
+                out |= got or every
+                why.append("imp")
+            else:
+                out |= got
+                why.append("newdef")
+            resc = None
         if why and set(why) == {"rt"}:
             RT[path] = rts
         RESC[path] = resc
