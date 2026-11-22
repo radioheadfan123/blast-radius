@@ -588,6 +588,8 @@ GATE = re.compile(r"sqlglot/(?!executor/)[\w/]+\.py")
 
 
 START = time.monotonic()
+BATCH = 100  # s the gates and import checks may use; main() scales it with the batch as the run has 3 min for 40
+# commits, 4.5 for 60, so one slow gate early in the final does not switch the later ones off
 
 
 GATES = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",  # test id -> <name>gate.py, map/<name>.md5
@@ -632,10 +634,18 @@ def gateable(num, files, sel, name=""):
     return all(((GATE.fullmatch(p) or exe(p)) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
+def gate_cpu(name, files):
+    """Board CPU seconds of one gate call (Boss round 3): a gate whose sim saving is below this costs more than it can
+    win. tpcds checks only the queries RT says the edits reach, else every query (8.3 s on the server for a patch it
+    passes; one it stops early on costs 1-2 s)."""
+    py = [p for p in files if p.endswith(".py")]
+    return {"nodes": 0.6, "gen": 1.3}.get(name) or (7 if py and all(RT.get(p) is not None for p in py) else 9)
+
+
 def unchanged(name, patch, files=()):
     """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
     that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
-    left = 100 - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
+    left = BATCH - (time.monotonic() - START)  # the whole batch must finish in 3 min; a slow or hung gate just keeps the test
     if left < 10:
         return False
     try:
@@ -643,8 +653,10 @@ def unchanged(name, patch, files=()):
         py = [p for p in files if p.endswith(".py")]
         if name == "tpcds" and py and all(RT.get(p) is not None for p in py):  # only the queries these edits can reach
             env = dict(os.environ, GATE_LINES=json.dumps({p: RT[p] for p in py}))
+        t0 = time.monotonic()
         r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
                            timeout=min(45, left), env=env)
+        log("gate", name, Path(patch).stem, f"wall {time.monotonic() - t0:.1f}", *r.stdout.split()[1:2])
         got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
         return (r.returncode == 0 and len(got) == len(want) and got[0] == want[0]
                 and (len(got) < 2 or float(got[1]) <= 1.5 * float(want[1]) + 0.1))
@@ -698,7 +710,7 @@ def lazy_ok(patch, files):
     if patch not in _lazy:
         code = ("import sys; sys.path.insert(0, sys.argv[1]); import patchutil as pu; pu.overlay(sys.argv[2], sys.argv[3]); "
                 "import sqlglot; print(len(sqlglot.Dialect._classes))")
-        left = 100 - (time.monotonic() - START)  # same batch budget as the gates; False keeps test_lazy_load
+        left = BATCH - (time.monotonic() - START)  # same batch budget as the gates; False keeps test_lazy_load
         try:
             if left < 10:
                 raise TimeoutError
@@ -720,7 +732,7 @@ _snap = {}
 def snapdiff(patch):
     """snap.py's {(label, key): (pinned fp, patched fp)} for the entries that differ, or None (no time, import fails)."""
     if patch not in _snap:
-        base, left, _snap[patch] = HERE / "map" / "dsnap.pkl", 100 - (time.monotonic() - START), None
+        base, left, _snap[patch] = HERE / "map" / "dsnap.pkl", BATCH - (time.monotonic() - START), None
         if left >= 15 and base.is_file():
             try:
                 r = subprocess.run([sys.executable, str(HERE / "snap.py"), str(SRC), str(patch), str(base)],
@@ -751,7 +763,7 @@ def keysel(patch, files):
     that looked up one of those keys; else None. snap.py fingerprints every module global and class attribute after
     importing every module, so an entry copied into other dicts or folded into anything else at import shows up too."""
     base, km = HERE / "map" / "dsnap.pkl", HERE / "map" / "keys.json"
-    left = 100 - (time.monotonic() - START)
+    left = BATCH - (time.monotonic() - START)
     if left < 15 or not (base.is_file() and km.is_file()):
         return None
     for p, hs in files.items():  # every edited line inside a dict display keymap.py recorded, or no ~3 s snapshot
@@ -937,8 +949,10 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         # every import edit sits in a function body that import also ran, and import built the same state
         chosen = set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
         whys.append("rescue")
-    for num, name in gated.items():
-        if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
+    for num, name in sorted(gated.items(), key=lambda g: g[1] == "tpcds"):  # tpcds last: its saving depends on the rest
+        if (num in chosen and gateable(num, files, sel, name)
+                and split(chosen, ms)[0] - split(chosen - {num}, ms)[0] > 1000 * gate_cpu(name, files)
+                and unchanged(name, patch, files)):
             chosen.discard(num)
             whys.append(f"{name}-gate")
     return chosen, whys, files
@@ -953,6 +967,8 @@ def main():
     ids = {t["number"]: t["id"] for t in tests}
     maps = load_maps()
     patches = sorted((DATA / "commits").glob("*.patch"))
+    global BATCH
+    BATCH = 100 * max(1, len(patches) / 40)
     out, queue = {}, []
     for patch in patches:
         try:
@@ -962,7 +978,8 @@ def main():
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
             chosen, whys = every, ["error", type(x).__name__]
         out[patch] = chosen, whys
-    limit = 140 * max(1, len(patches) / 40)  # the batch has 3 min for 40 commits, 4.5 for 60: runs stop well before
+    log("picked", round(time.monotonic() - START, 1))
+    limit = 1.4 * BATCH  # the batch has 3 min for 40 commits, 4.5 for 60: runs stop well before
     spent = 0.0  # child CPU of the runs so far: the board adds every CPU second to the score
     for _, patch, files in sorted(queue, key=lambda q: -q[0]):  # best saving per CPU second first
         chosen, whys = out[patch]
@@ -973,7 +990,9 @@ def main():
         wait = 2 * s * p[2] + 2  # a patch that makes a test hang or crawl times the run out: keep what passed by then
         if time.monotonic() - START + wait > limit or spent + s * p[2] > BUDGET:
             continue
-        ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
+        t0 = time.monotonic()
+        ok, cpu, rss = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
+        log("run", patch.stem, len(p[1]), f"wall {time.monotonic() - t0:.1f}", f"cpu {cpu:.1f}", f"wait {wait:.0f}", f"rss {rss}M")
         CAL[0], CAL[1], spent = CAL[0] + cpu, CAL[1] + p[2], spent + cpu
         if ok:
             num = {ids[n]: n for n in p[1]}
