@@ -634,6 +634,13 @@ def gateable(num, files, sel, name=""):
     return all(((GATE.fullmatch(p) or exe(p)) and files[p]) or (not p.endswith(".py") and sel[p] is not None and num not in sel[p]) for p in files)
 
 
+def gate_cpu(name, files):
+    """Board CPU seconds of one tpcds gate call, from board pairs (Boss round 4): about 2.5 s when it checks only the
+    queries RT says the edits reach, about 7 s for every query. Other gates are not priced (no board data): always run."""
+    py = [p for p in files if p.endswith(".py")]
+    return 0 if name != "tpcds" else 2.5 if py and all(RT.get(p) is not None for p in py) else 7
+
+
 def unchanged(name, patch, files=()):
     """True when <name>gate.py digests the patched tree the same as the pinned one, so its test cannot break. A gate
     that also prints CPU seconds must stay within 1.5x the pinned run (a slower parse can time the real test out)."""
@@ -941,8 +948,10 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         # every import edit sits in a function body that import also ran, and import built the same state
         chosen = set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
         whys.append("rescue")
-    for num, name in gated.items():
-        if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
+    for num, name in sorted(gated.items(), key=lambda g: g[1] == "tpcds"):  # tpcds last: its saving depends on the rest
+        if (num in chosen and gateable(num, files, sel, name)
+                and split(chosen, ms)[0] - split(chosen - {num}, ms)[0] > 1000 * gate_cpu(name, files)
+                and unchanged(name, patch, files)):
             chosen.discard(num)
             whys.append(f"{name}-gate")
     return chosen, whys, files
