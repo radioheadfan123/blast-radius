@@ -61,13 +61,19 @@ def changed_lines(hunks):
 
 
 def apply(old_lines, hunks):
-    """old_lines: list of lines without newline. Returns new list."""
+    """old_lines: list of lines without newline. Returns new list. Raises ValueError when a context or removed line is
+    not the pinned file's line at that spot (a patch made against another tree): the selector then runs every test
+    rather than narrowing on a mis-spliced file."""
     out, pos = [], 0
     for start, body in hunks:
         s = start - 1 if start > 0 else 0
+        if s < pos:
+            raise ValueError(f"hunk at line {start} overlaps the one before")
         out.extend(old_lines[pos:s])
         pos = s
         for tag, text in body:
+            if tag != "+" and (pos >= len(old_lines) or old_lines[pos] != text):
+                raise ValueError(f"line {pos + 1} does not match the patch")
             if tag == " ":
                 out.append(old_lines[pos]); pos += 1
             elif tag == "-":
