@@ -785,9 +785,11 @@ def main():
         else:
             STAT[0] += 1  # all pass: the commit would be empty
             STAT[1] += split(chosen, ms)[0]
-    a, b, c, d, e, f, g = STAT
-    code = min(a, 7) + 8 * (min(round(b / 3000), 15) + 16 * (min(c, 15) + 16 * (min(d + f, 7) + 8 * (
-        min(e, 3) + 4 * min(g, 15)))))
+            AP.append((split(chosen, ms)[0], describe(split(chosen, ms)[0], out[patch][1], FILES[patch]), patch.stem))
+    AP.sort(reverse=True)
+    x = [d for _, d, _ in AP[:2]] + [0, 0]
+    code = x[0] + 1024 * x[1]
+    log("allpass", AP)
     rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
     rem = (code - sum(c for _, c, _ in rows)) % M
     log("probe", STAT, code, rem)
@@ -801,7 +803,46 @@ def main():
     log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
 
 
-FILES, RAN = {}, set()
+FILES, RAN, AP = {}, set(), []
+DIRS = [r"sqlglot/parsers/", r"sqlglot/generators/", r"sqlglot/dialects/", r"sqlglot/(tokens|tokenizer)",
+        r"sqlglot/expressions/", r"sqlglot/(parser|generator)\.py$", r"sqlglot/"]
+
+
+def describe(cost, whys, files):
+    """Probe only, 10 bits for an all-pass commit: kind k (1 imp, 2 cls, 3 attr, 4 dflt, 5 rt only, 6 two of 1-4,
+    7 other), dir of its first file (DIRS index + 1, 0 outside sqlglot/), one dict entry's value edited in a class-level
+    dict literal (one file), cost in 3 s units (cap 7): k + 8 x (d + 8 x (s + 2 x c))."""
+    tags = {t for w in whys for t in w.split("+")}
+    ks = tags & {"imp", "cls", "attr", "dflt"}
+    k = 6 if len(ks) > 1 else {"imp": 1, "cls": 2, "attr": 3, "dflt": 4}[ks.pop()] if ks else 5 if "rt" in tags else 7
+    p = next(iter(files))
+    d = next((i for i, r in enumerate(DIRS, 1) if re.match(r, p)), 0)
+    try:
+        s = int(len(files) == 1 and dict_entry_edit(p, files[p]))
+    except Exception:  # noqa: probe only, never lose the run
+        s = 0
+    return k + 8 * (d + 8 * (s + 2 * min(round(cost / 3000), 7)))
+
+
+def dict_entry_edit(path, hunks):
+    """Every edited line sits in the value of one entry of a dict literal assigned in a class body, key unchanged."""
+    spans = []
+    for c in ast.walk(ast.parse((SRC / path).read_text())):
+        if isinstance(c, ast.ClassDef):
+            for st in c.body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Dict):
+                    spans += [(k.end_lineno, k.end_col_offset, v.end_lineno)
+                              for k, v in zip(st.value.keys, st.value.values) if k is not None]
+    hit = set()
+    for ln, o, w in edits(hunks):
+        if o is None or w is None:
+            return False
+        c0 = span(o, w)[0]
+        m = [sp for sp in spans if sp[0] <= ln <= sp[2] and (ln > sp[0] or c0 >= sp[1])]
+        if not m:
+            return False
+        hit.add(m[0])
+    return len(hit) == 1
 STAT = [0] * 7  # all-pass (emptied), their sim ms, failing, passed partly, no time, nothing runnable, not .py edits
 M = 8 * 16 * 16 * 8 * 4 * 16
 PLIM = 155  # probe runs stop here per 40 commits (the batch has about 180 s)
