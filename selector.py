@@ -5,6 +5,7 @@ import tokenize
 import importlib.util
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -83,6 +84,64 @@ def edits(hunks):
     return out
 
 
+def inserted(hunks):
+    """New-file line numbers of the added lines edits() reports without an old line, in the same order."""
+    out, d = [], 0
+    for start, body in hunks:
+        n, m, i = start, start + d, 0
+        while i < len(body):
+            if body[i][0] == " ":
+                n += 1; m += 1; i += 1
+                continue
+            k = i
+            while i < len(body) and body[i][0] == "-":
+                i += 1
+            nm, k = i - k, i
+            while i < len(body) and body[i][0] == "+":
+                i += 1
+            out += [m + j for j in range(nm, i - k)]
+            n, m = n + nm, m + i - k
+        d = m - n
+    return out
+
+
+def new2old(hunks, m):
+    """Old line number of new line m, None if m was added."""
+    d = 0
+    for start, body in hunks:
+        if m < start + d:
+            break
+        n, k = start, start + d
+        for t, _ in body:
+            if t != "-" and k == m:
+                return n if t == " " else None
+            n, k = n + (t != "+"), k + (t != "-")
+        d = k - n
+    return m - d
+
+
+def def_at(regs, ln, text):
+    """Function bodies holding all of line ln, innermost first, as (region, def node)."""
+    c0 = len(text) - len(text.lstrip())
+    got = [r for r in regs if isinstance(r[4], (ast.FunctionDef, ast.AsyncFunctionDef))
+           and (r[0], r[1]) <= (ln, c0) and (ln, len(text.rstrip())) <= (r[2], r[3])]
+    return sorted(got, key=lambda r: (r[0], r[1]), reverse=True)
+
+
+def one_sided(regs, nregs, hunks, ln, o, w, m):
+    """Old function region a whole added or removed line sits in, or None. A removed line is placed in the old tree, an
+    added one in the patched tree and mapped back by its def line (a def the patch adds is skipped for its parent).
+    Lines that leave a function body (dedent to class or module level) find no def and stay import edits."""
+    if w is None:
+        got = def_at(regs, ln, o)
+        return got[0] if got else None
+    old = {(r[4].lineno, r[4].name): r for r in regs if isinstance(r[4], (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for r in def_at(nregs, m, w):
+        if (lo := new2old(hunks, r[4].lineno)) is not None and (lo, r[4].name) in old:
+            return old[(lo, r[4].name)]
+    return None
+
+
 def span(o, w):
     """Column range in the old line that differs from the new one."""
     if o is None or w is None:
@@ -157,7 +216,17 @@ def class_setting(tree, ln):
     return None
 
 
-_src, _rng, _enums = {}, {}, {}
+_src, _rng, _enums, _pre = {}, {}, {}, {}
+
+
+def pre():
+    """map/pre.pkl, made at build by `selector.py --pre`: stmt_range of every pinned sqlglot file, every word in them,
+    and the files a bare `import sqlglot` loads. Missing: everything is worked out here as before."""
+    if not _pre:
+        p = HERE / "map" / "pre.pkl"
+        _pre.update(pickle.loads(p.read_bytes()) if p.is_file() else {"rng": {}})
+        _rng.update(_pre["rng"])
+    return _pre
 
 
 def sources():
@@ -225,7 +294,7 @@ def same_meaning(old, new):
 def readers(name, m, attr_ok=False):
     """Tests that ran a line reading `name` at call time; None if anything reads it at import time.
     attr_ok: import-time `.name` reads are known to hit other classes' copies, only bare-word reads count."""
-    sources()
+    sources(), pre()
     word = re.compile(r"\b%s\b" % re.escape(name))
     bare = re.compile(r"(?<!\.)\b%s\b" % re.escape(name))
     define = re.compile(r"^\s*%s\s*(:[^=]*)?=[^=]" % re.escape(name))
@@ -363,7 +432,7 @@ def unknown_name(path, w):
     if w is None:
         return False
     if not _words:
-        _words.append(set(re.findall(r"\w+", "\n".join(sources().values()))))
+        _words.append(pre().get("words") or set(re.findall(r"\w+", "\n".join(sources().values()))))
     names = set()
     try:
         for tok in tokenize.generate_tokens(io.StringIO(w.strip() + "\n").readline):
@@ -397,12 +466,19 @@ def select(path, hunks, m, every):
             return None, "broken"
     if path.startswith("sqlglot/") and path.endswith(".py") and (SRC / path).is_file():
         fm = m["files"].get(path, {})
-        regs, rng = regions(tree), stmt_range(tree)
+        regs, rng = regions(tree), pre()["rng"].get(path) or stmt_range(tree)
         out, why, rts = set(), [], []
+        ins, nregs = iter(inserted(hunks)), None
         for ln, o, w in edits(hunks):
             c0, c1 = span(o, w)
             reg = runtime(regs, ln, c0, c1) if o is not None and w is not None else None
             lo, hi = rng.get(ln, (ln, ln))
+            if o is None or w is None:  # a line added or removed outright: every test that ran the function it sits in
+                if o is None and nregs is None:
+                    nregs = regions(ast.parse("\n".join(pu.apply((SRC / path).read_text().splitlines(), hunks)) + "\n"))
+                reg = one_sided(regs, nregs, hunks, ln, o, w, next(ins) if o is None else None)
+                if reg:
+                    lo, hi = reg[0], reg[2]
             if reg and set(range(lo, hi + 1)) & set(m["imp"].get(path, ())):
                 # a function body that also runs at import (a metaclass, a trie built for a class): coverage only sees
                 # the tests that re-ran it, not every test that uses what import built, so treat it as an import edit
@@ -588,9 +664,13 @@ def plan(chosen, files, ids, ms):
 _lazy = {}
 
 
-def lazy_ok(patch):
+def lazy_ok(patch, files):
     """test_lazy_load runs `import sqlglot` in a fresh python, which coverage never sees: True when that import, on the
     patched tree, still loads only the default dialect, so the test cannot fail."""
+    if patch not in _lazy and (lz := pre().get("lazy")) is not None and not re.search(
+            r"^(?:new file mode|deleted file mode|rename from|copy from)", patch.read_text(errors="replace"), re.M) and all(
+            p.endswith(".py") and hs and (SRC / p).is_file() and p not in lz for p, hs in files.items()):
+        _lazy[patch] = True  # edits only files a bare `import sqlglot` never loads: the same modules load as pinned
     if patch not in _lazy:
         code = ("import sys; sys.path.insert(0, sys.argv[1]); import patchutil as pu; pu.overlay(sys.argv[2], sys.argv[3]); "
                 "import sqlglot; print(len(sqlglot.Dialect._classes))")
@@ -604,6 +684,57 @@ def lazy_ok(patch):
         except Exception:  # noqa: timeout
             _lazy[patch] = False
     return _lazy[patch]
+
+
+KEYMIN = float(os.environ.get("KEYMIN", 5000))  # ms of selected work worth a ~3 s CPU state snapshot
+
+
+_keys = {}
+
+
+def keysel(patch, files):
+    """When the patched tree imports to the same state as the pinned one except for values of existing entries in
+    dicts that map/keys.json recorded per key (dicts nothing iterated, copied or compared while tests ran), the tests
+    that looked up one of those keys; else None. snap.py fingerprints every module global and class attribute after
+    importing every module, so an entry copied into other dicts or folded into anything else at import shows up too."""
+    base, km = HERE / "map" / "dsnap.pkl", HERE / "map" / "keys.json"
+    left = 100 - (time.monotonic() - START)
+    if left < 15 or not (base.is_file() and km.is_file()):
+        return None
+    for p, hs in files.items():  # every edited line inside a dict display keymap.py recorded, or no ~3 s snapshot
+        lines = set()
+
+        def body(b):
+            for s in b:
+                if isinstance(s, (ast.Assign, ast.AnnAssign)) and isinstance(s.value, (ast.Dict, ast.DictComp)):
+                    lines.update(range(s.value.lineno, s.value.end_lineno + 1))
+                elif isinstance(s, ast.ClassDef):
+                    body(s.body)
+                elif isinstance(s, (ast.If, ast.Try, ast.With)):
+                    for b2 in [s.body, getattr(s, "orelse", []), getattr(s, "finalbody", [])] + [h.body for h in getattr(s, "handlers", [])]:
+                        body(b2)
+        body(ast.parse((SRC / p).read_text()).body)
+        if not {ln for ln, _, _ in edits(hs)} <= lines:  # a cheap filter: the snapshot diff below is the check
+            return None
+    try:
+        r = subprocess.run([sys.executable, str(HERE / "snap.py"), str(SRC), str(patch), str(base)], capture_output=True,
+                           timeout=min(30, left), env=dict(os.environ, PYTHONHASHSEED="0"))
+        if r.returncode:
+            return None
+        diff = pickle.loads(r.stdout)
+        if "d" not in _keys:
+            _keys.update(json.loads(km.read_text()))
+        K = _keys
+    except Exception:  # noqa: timeout
+        return None
+    out = set()
+    for (label, key), (x, y) in diff.items():
+        e = K["d"].get(label)
+        if key is None or x is None or y is None or not e or "k" not in e or e["k"].get(key, 0) == -1:
+            return None  # not a dict value, a key added or removed, or a dict read some other way
+        if key in e["k"]:
+            out |= set(K["sets"][e["k"][key]])
+    return out
 
 
 NEW = re.compile(r"^diff --git a/(\S+) b/\1\nnew file mode", re.M)
@@ -696,6 +827,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
     for b in re.findall(r"^diff --git a/.* b/(.*)$", text, re.M):
         files.setdefault(b, [])  # binary, rename or mode-only: no hunks, still a changed file
     new = set(NEW.findall(text))
+    gone = set(re.findall(r"^diff --git a/(\S+) b/\1\ndeleted file mode", text, re.M))
     ADDS.clear()
     ADDS.update({p: {x for _, b in hs for t, l in b if t == "+" for x in re.findall(r"\w+", l)} for p, hs in files.items()})
     chosen, whys, sel = set(), [], {}
@@ -706,11 +838,16 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
             got = new_module(path, ids) if path.startswith("sqlglot/") else new_test_file(path, hunks)
         if got is not None:  # else fall through: the old rules still own every file the new rule does not claim
             why = "new"
+        elif (path in ("pyproject.toml", "setup.py", "setup.cfg") and hunks and (SRC / path).is_file() and path not in gone
+              and not any("pytest" in l for _, b in hunks for t, l in b if t != " ")):
+            # tests run from the checkout on PYTHONPATH, nothing installs it; test_sqlglotc builds in a temp dir with a
+            # pretend version. Only pytest reads these files, from a [tool.pytest*] / [tool:pytest] table
+            got, why = set(), "pack"
         elif path.startswith("sqlglotc/"):  # only test_sqlglotc runs sqlglotc/setup.py; nothing else reads sqlglotc/
             got, why = {n for n, i in ids.items() if i.startswith("tests/test_sqlglotc.py::")}, "sqlglotc"
         else:
             got, why = select(path, hunks, maps, every)
-        if got is not None and "imp" in why.split("+") and not lazy_ok(patch):
+        if got is not None and "imp" in why.split("+") and not lazy_ok(patch, files):
             got = got | {n for n, i in ids.items() if i.endswith("::test_lazy_load")}
         if why == "fixture" and path.endswith(".sql") and (r := reads(path, hunks)):
             if r[0] == r[1]:  # comments, blank lines: no test can see the edit
@@ -722,6 +859,13 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         whys.append(why)
         sel[path] = got
         chosen |= every if got is None else got
+    parts = {w for y in whys for w in y.split("+")}
+    if (parts & {"imp", "attr", "cls"} and parts <= {"imp", "attr", "cls"} and split(chosen, ms)[0] >= KEYMIN
+            and all(p.startswith("sqlglot/") and p.endswith(".py") and hs and (SRC / p).is_file() for p, hs in files.items())):
+        ks = keysel(patch, files)
+        if ks is not None:
+            chosen = ks | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
+            whys.append(f"keys{len(ks)}")
     for num, name in gated.items():
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
@@ -770,5 +914,20 @@ def main():
         print(json.dumps({"commit": patch.stem, "workers": ws}))
     log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
 
+
+def build_pre():
+    """map/pre.pkl (see pre()). The import list comes from a fresh python, as test_lazy_load runs it."""
+    code = "import sys; sys.path.insert(0, sys.argv[1]); import sqlglot; print(*[getattr(m, '__file__', None) or '' for m in list(sys.modules.values())])"
+    got = subprocess.run([sys.executable, "-c", code, str(SRC)], capture_output=True, text=True, check=True).stdout.split()
+    root = SRC.resolve()
+    lazy = {str(Path(f).resolve().relative_to(root)) for f in got if Path(f).resolve().is_relative_to(root)}
+    assert "sqlglot/__init__.py" in lazy, lazy
+    src = sources()
+    out = {"rng": {p: stmt_range(ast.parse(t)) for p, t in src.items()}, "words": set(re.findall(r"\w+", "\n".join(src.values()))),
+           "lazy": lazy}
+    (HERE / "map" / "pre.pkl").write_bytes(pickle.dumps(out))
+    log(len(out["rng"]), "files,", len(lazy), "loaded by import sqlglot")
+
+
 if __name__ == "__main__":
-    main()
+    build_pre() if sys.argv[1:] == ["--pre"] else main()
