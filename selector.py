@@ -724,11 +724,25 @@ def keysel(patch, files):
         diff = pickle.loads(r.stdout)
         if "d" not in _keys:
             _keys.update(json.loads(km.read_text()))
+            am = HERE / "map" / "args.json"
+            if am.is_file():
+                _keys["A"] = json.loads(am.read_text())
         K = _keys
     except Exception:  # noqa: timeout
         return None
     out = set()
     for (label, key), (x, y) in diff.items():
+        if "A" in K and label.endswith(".required_args") and key is None and x and y and x[0] == y[0] == "set":
+            # arg_types values only feed required_args, which only error_messages reads: the tests where it ran on
+            # an instance of this class missing a key that changed sides
+            for k in {v for _, v in x[1:]} ^ {v for _, v in y[1:]}:
+                s = K["A"]["p"].get(f"{label[:-14]}|{k}")
+                if s == -1:
+                    return None
+                out |= set(K["A"]["sets"][s]) if s is not None else set()
+            continue
+        if "A" in K and label.endswith(".arg_types") and key is not None and x is not None and y is not None:
+            continue  # a value read only by __init_subclass__ (core.py:110); its effect is the required_args entry
         e = K["d"].get(label)
         if key is None or x is None or y is None or not e or "k" not in e or e["k"].get(key, 0) == -1:
             return None  # not a dict value, a key added or removed, or a dict read some other way
