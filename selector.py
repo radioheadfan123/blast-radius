@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import re
+import resource
 import subprocess
 import sys
 import time
@@ -646,7 +647,7 @@ def unchanged(name, patch, files=()):
         if name == "tpcds" and py and all(RT.get(p) is not None for p in py):  # only the queries these edits can reach
             env = dict(os.environ, GATE_LINES=json.dumps({p: RT[p] for p in py}))
         t0 = time.monotonic()
-        r = subprocess.run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
+        r = _run([sys.executable, str(HERE / f"{name}gate.py"), str(patch)], capture_output=True, text=True,
                            timeout=min(45, left), env=env)
         log("gate", name, Path(patch).stem, f"wall {time.monotonic() - t0:.1f}", *r.stdout.split()[1:2])
         got, want = r.stdout.split(), (HERE / "map" / f"{name}.md5").read_text().split()
@@ -706,7 +707,7 @@ def lazy_ok(patch, files):
         try:
             if left < 10:
                 raise TimeoutError
-            r = subprocess.run([sys.executable, "-c", code, str(HERE), str(patch), str(SRC)], capture_output=True,
+            r = _run([sys.executable, "-c", code, str(HERE), str(patch), str(SRC)], capture_output=True,
                                text=True, timeout=min(30, left))
             _lazy[patch] = r.returncode == 0 and r.stdout.split() == ["1"]
         except Exception:  # noqa: timeout
@@ -727,7 +728,7 @@ def snapdiff(patch):
         base, left, _snap[patch] = HERE / "map" / "dsnap.pkl", BATCH - (time.monotonic() - START), None
         if left >= 15 and base.is_file():
             try:
-                r = subprocess.run([sys.executable, str(HERE / "snap.py"), str(SRC), str(patch), str(base)],
+                r = _run([sys.executable, str(HERE / "snap.py"), str(SRC), str(patch), str(base)],
                                    capture_output=True, timeout=min(30, left), env=dict(os.environ, PYTHONHASHSEED="0"))
                 if not r.returncode:
                     _snap[patch] = pickle.loads(r.stdout)
@@ -988,15 +989,51 @@ def main():
         ok, cpu, rss = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
         log("run", patch.stem, len(p[1]), f"wall {time.monotonic() - t0:.1f}", f"cpu {cpu:.1f}", f"wait {wait:.0f}", f"rss {rss}M")
         CAL[0], CAL[1], spent = CAL[0] + cpu, CAL[1] + p[2], spent + cpu
+        PSTAT["run"] = PSTAT.get("run", 0) + cpu
         if ok:
             num = {ids[n]: n for n in p[1]}
             out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
-    for patch in patches:
-        chosen, whys = out[patch]
-        cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+    g = lambda k: PSTAT.get(k, 0)  # noqa: E731
+    T, O, S = (round(x / 0.5) for x in (g("tpcdsgate"), g("gengate") + g("nodesgate") + g("lazy"), g("snap")))
+    code = min(T, 63) + 64 * (min(round(g("run")), 15) + 16 * (min(O, 31) + 32 * min(S, 31)))
+    rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
+    rem = (code - sum(c for _, c, _ in rows)) % M
+    log("probe", {k: round(v, 2) for k, v in PSTAT.items()}, code, rem)
+    for patch, cost, ws in rows:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - out[patch][0]) - 20000)
+            if pad(chunk, out[patch][0], ws, ms):
+                rem -= chunk
+        log(patch.stem, out[patch][1], len(out[patch][0]), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
+
+
+# Probe only, never FINAL: board sim in ms mod M = T + 64 x (W + 16 x (O + 32 x S)): child CPU in 0.5 s of the tpcds
+# gate T, warm runs W (1 s), gen + nodes gates + lazy_ok O, snap.py S. Board CPU minus all four = the parent itself.
+PSTAT = {}
+M = 64 * 16 * 32 * 32  # 1048576
+_kids = lambda: (lambda r: r.ru_utime + r.ru_stime)(resource.getrusage(resource.RUSAGE_CHILDREN))  # noqa: E731
+
+
+def _run(argv, *a, **k):
+    tag, t0 = "lazy" if argv[1] == "-c" else Path(argv[1]).stem, _kids()
+    try:
+        return subprocess.run(argv, *a, **k)
+    finally:
+        PSTAT[tag] = PSTAT.get(tag, 0) + _kids() - t0
+
+
+def pad(code, chosen, ws, ms):
+    """Add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 
 def build_pre():
