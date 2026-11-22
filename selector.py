@@ -981,7 +981,8 @@ DIRS = [r"sqlglot/parsers/", r"sqlglot/generators/", r"sqlglot/dialects/", r"sql
 def describe(cost, whys, files):
     """Probe only, 10 bits for an all-pass commit: kind k (1 imp, 2 cls, 3 attr, 4 dflt, 5 rt only, 6 two of 1-4,
     7 other), dir of its first file (DIRS index + 1, 0 outside sqlglot/), one dict entry's value edited in a class-level
-    dict literal (one file), cost in 3 s units (cap 7): k + 8 x (d + 8 x (s + 2 x c))."""
+    dict literal (one file), o any line added or removed outright, l class level (where()) of its first file:
+    k + 8 x (d + 8 x (s + 2 x (o + 2 x l)))."""
     tags = {t for w in whys for t in w.split("+")}
     ks = tags & {"imp", "cls", "attr", "dflt"}
     k = 6 if len(ks) > 1 else {"imp": 1, "cls": 2, "attr": 3, "dflt": 4}[ks.pop()] if ks else 5 if "rt" in tags else 7
@@ -991,7 +992,28 @@ def describe(cost, whys, files):
         s = int(len(files) == 1 and dict_entry_edit(p, files[p]))
     except Exception:  # noqa: probe only, never lose the run
         s = 0
-    return k + 8 * (d + 8 * (s + 2 * min(round(cost / 3000), 7)))
+    o = int(any(o is None or w is None for hs in files.values() for _, o, w in edits(hs)))
+    try:
+        l = where(p, files[p]) if p.endswith(".py") and (SRC / p).is_file() else 0
+    except Exception:  # noqa: probe only
+        l = 0
+    return k + 8 * (d + 8 * (s + 2 * (o + 2 * l)))
+
+
+def where(path, hunks):
+    """Probe only: 1 an edited line sits in a class-level TRANSFORMS assignment, 2 in another class-level dict
+    assignment, 3 elsewhere in a class body outside any def (lambdas count as class level), 0 none."""
+    tree, spans = ast.parse((SRC / path).read_text()), []
+    for c in ast.walk(tree):
+        if isinstance(c, ast.ClassDef):
+            for st in c.body:
+                if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    ts = st.targets if isinstance(st, ast.Assign) else [getattr(st, "target", None)]
+                    names = {t.id for t in ts if isinstance(t, ast.Name)}
+                    kind = 1 if "TRANSFORMS" in names else 2 if isinstance(getattr(st, "value", None), ast.Dict) else 3
+                    spans.append((st.lineno, st.end_lineno, kind))
+    got = [kd for ln, _, _ in edits(hunks) for a, b, kd in spans if a <= ln <= b]
+    return min(got, default=0)
 
 
 def dict_entry_edit(path, hunks):
