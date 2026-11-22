@@ -28,7 +28,10 @@ def log(*a):
 
 
 def load_maps():
-    return json.loads((HERE / "map" / "lines.json").read_text())
+    m = json.loads((HERE / "map" / "lines.json").read_text())
+    c = HERE / "map" / "col.json"  # sqlglot lines pytest collection ran, all of sqlglot already imported (colmap.py)
+    m["col"] = json.loads(c.read_text()) if c.is_file() else None
+    return m
 
 
 def regions(tree):
@@ -448,11 +451,15 @@ def unknown_name(path, w):
 
 
 RT = {}  # path -> call-time edits [(lo, hi, body_lo, body_hi)] for the tpcds gate; None when any edit is not call-time
+RESC = {}  # path -> coverage tests if its only import-time edits sit in function bodies import also ran, else None
+# ponytail: a hand list of per-process caches filled at call time (generator.py's _DISPATCH_CACHE, once per class):
+# coverage credits only the first test per class, and the import snapshot holds only classes built at import
+NOCACHE = {"sqlglot/generator.py": {"_build_dispatch", "__init__"}}
 
 
 def select(path, hunks, m, every):
     sets = m["sets"]
-    RT[path] = None
+    RT[path] = RESC[path] = None
     if DOCS.fullmatch(path) and path not in m["fixtures"]:
         return set(), "docs"
     if path.endswith(".py") and (SRC / path).is_file():
@@ -468,6 +475,8 @@ def select(path, hunks, m, every):
         fm = m["files"].get(path, {})
         regs, rng = regions(tree), pre()["rng"].get(path) or stmt_range(tree)
         out, why, rts = set(), [], []
+        resc, col = set(), m.get("col")
+        col = None if col is None else set(col.get(path, ()))
         ins, nregs = iter(inserted(hunks)), None
         for ln, o, w in edits(hunks):
             c0, c1 = span(o, w)
@@ -481,13 +490,27 @@ def select(path, hunks, m, every):
                     lo, hi = reg[0], reg[2]
             if reg and set(range(lo, hi + 1)) & set(m["imp"].get(path, ())):
                 # a function body that also runs at import (a metaclass, a trie built for a class): coverage only sees
-                # the tests that re-ran it, not every test that uses what import built, so treat it as an import edit
+                # the tests that re-ran it, not every test that uses what import built, so treat it as an import edit.
+                # pick() may rescue it: if the patched tree imports to the same state (snapshot), its coverage tests.
+                # Not if collection ran the body (test-module state no snapshot sees) or it fills a call-time cache
+                # (NOCACHE, or any enclosing def or edited line mentioning a cache: @lru_cache, functools.cache, a dict)
+                if (col is None or set(range(reg[0], reg[2] + 1)) & col
+                        or any(t is not None and "cache" in t.lower() for t in (o, w))
+                        or any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno <= reg[0] <= reg[2] <= n.end_lineno
+                               and (n.name in NOCACHE.get(path, ()) or "cache" in ast.unparse(n).lower()) for *_, n in regs)):
+                    resc = None
+                elif resc is not None:
+                    resc |= tests_in(fm, sets, lo, hi) or tests_in(fm, sets, reg[0], reg[2])
                 reg = None
+            elif not reg:
+                resc = None
             if reg:
                 got = tests_in(fm, sets, lo, hi)
                 if not got:  # ponytail: edited line never ran; whole enclosing function as a cheap safety net
                     got = tests_in(fm, sets, reg[0], reg[2])
                 out |= got
+                if resc is not None:
+                    resc |= got
                 why.append("rt")
                 rts.append((lo, hi, reg[0], reg[2]))
             else:
@@ -531,6 +554,7 @@ def select(path, hunks, m, every):
                 why.append("imp")
         if why and set(why) == {"rt"}:
             RT[path] = rts
+        RESC[path] = resc
         return out, "+".join(sorted(set(why)))
     if path in m["fixtures"]:
         return set(sets[m["fixtures"][path]]), "fixture"
@@ -690,6 +714,35 @@ KEYMIN = float(os.environ.get("KEYMIN", 5000))  # ms of selected work worth a ~3
 
 
 _keys = {}
+_snap = {}
+
+
+def snapdiff(patch):
+    """snap.py's {(label, key): (pinned fp, patched fp)} for the entries that differ, or None (no time, import fails)."""
+    if patch not in _snap:
+        base, left, _snap[patch] = HERE / "map" / "dsnap.pkl", 100 - (time.monotonic() - START), None
+        if left >= 15 and base.is_file():
+            try:
+                r = subprocess.run([sys.executable, str(HERE / "snap.py"), str(SRC), str(patch), str(base)],
+                                   capture_output=True, timeout=min(30, left), env=dict(os.environ, PYTHONHASHSEED="0"))
+                if not r.returncode:
+                    _snap[patch] = pickle.loads(r.stdout)
+            except Exception:  # noqa: timeout
+                pass
+    return _snap[patch]
+
+
+def nocode(v):
+    """A fingerprint with every code object's fingerprint blanked: what is left is the state import built."""
+    if isinstance(v, tuple):
+        return ("code",) if v and v[0] == "code" else tuple(nocode(x) for x in v)
+    return v
+
+
+def same_state(patch):
+    """True if the patched tree imports to the pinned state except for the code of functions (edited bodies)."""
+    diff = snapdiff(patch)
+    return diff is not None and all(x is not None and y is not None and nocode(x) == nocode(y) for x, y in diff.values())
 
 
 def keysel(patch, files):
@@ -716,12 +769,10 @@ def keysel(patch, files):
         body(ast.parse((SRC / p).read_text()).body)
         if not {ln for ln, _, _ in edits(hs)} <= lines:  # a cheap filter: the snapshot diff below is the check
             return None
+    diff = snapdiff(patch)
+    if diff is None:
+        return None
     try:
-        r = subprocess.run([sys.executable, str(HERE / "snap.py"), str(SRC), str(patch), str(base)], capture_output=True,
-                           timeout=min(30, left), env=dict(os.environ, PYTHONHASHSEED="0"))
-        if r.returncode:
-            return None
-        diff = pickle.loads(r.stdout)
         if "d" not in _keys:
             _keys.update(json.loads(km.read_text()))
             am = HERE / "map" / "args.json"
@@ -846,6 +897,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
     ADDS.update({p: {x for _, b in hs for t, l in b if t == "+" for x in re.findall(r"\w+", l)} for p, hs in files.items()})
     chosen, whys, sel = set(), [], {}
     RT.clear()
+    RESC.clear()
     for path, hunks in files.items():
         got = None
         if path in new and not (SRC / path).exists():
@@ -880,6 +932,11 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         if ks is not None:
             chosen = ks | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
             whys.append(f"keys{len(ks)}")
+    if ("imp" in parts and not any(w.startswith("keys") for w in whys) and split(chosen, ms)[0] >= KEYMIN
+            and all(RESC.get(p) is not None and hs for p, hs in files.items()) and same_state(patch)):
+        # every import edit sits in a function body that import also ran, and import built the same state
+        chosen = set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
+        whys.append("rescue")
     for num, name in gated.items():
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
