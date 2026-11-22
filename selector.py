@@ -498,10 +498,10 @@ GATES = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",  #
 TPC = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
 
 
-def same_inputs(path, hunks):
-    """True if a TPC fixture edit leaves every query's options and input SQL as tests/helpers.py reads them, so only
-    expected outputs change. TestExecutor loads both files in setUpClass but reads expected SQL only in
-    test_optimized_tpch, and only TPC-H's."""
+def reads(path, hunks):
+    """(before, after): what tests/helpers.py's two loaders return for a .sql fixture without and with the patch. Tests
+    read .sql fixtures only through them (the files tests open directly are jsonpath's cts.json and the executor's
+    csv tables). None when either cannot be read: that breaks setUpClass."""
     try:
         spec = importlib.util.spec_from_file_location("fixture_helpers", SRC / "tests" / "helpers.py")
         h = importlib.util.module_from_spec(spec)
@@ -510,10 +510,17 @@ def same_inputs(path, hunks):
         new.parent.mkdir(parents=True, exist_ok=True)
         new.write_text("\n".join(pu.apply((SRC / path).read_text(encoding="utf-8").splitlines(), hunks)) + "\n",
                        encoding="utf-8")
-        read = lambda f: [(meta, sql) for meta, sql, _ in h.load_sql_fixture_pairs(str(f))]  # absolute path wins the join
-        return read(new) == read((SRC / path).resolve())
-    except Exception:  # noqa: a fixture the loader cannot read breaks setUpClass
-        return False
+        read = lambda f: (list(h.load_sql_fixtures(str(f))), list(h.load_sql_fixture_pairs(str(f))))  # absolute path wins the join
+        return read((SRC / path).resolve()), read(new)
+    except Exception:  # noqa
+        return None
+
+
+def same_inputs(r):
+    """True if a TPC fixture edit leaves every query's options and input SQL as load_sql_fixture_pairs reads them, so
+    only expected outputs change. TestExecutor loads both files in setUpClass but reads expected SQL only in
+    test_optimized_tpch, and only TPC-H's."""
+    return [x[:2] for x in r[0][1]] == [x[:2] for x in r[1][1]]
 
 
 def gateable(num, files, sel, name=""):
@@ -550,6 +557,7 @@ NORUN = ("::test_lazy_load", "tests/test_sqlglotc.py::", "tests/test_typing.py::
 # extension; test_typing scans typing/__file__, which the overlay moves; the memory test's result depends on what ran
 # before it in its process (mutrun seed 101 caught one); the gates own the other two
 CPU = json.loads((HERE / "map" / "cpu.json").read_text())  # CPU s per test and per class setup ("<mod.Class>"), here
+BUDGET = float(os.environ.get("BUDGET", 8))  # total warm-run CPU s per batch: rivals spend 1-14 s CPU on the whole board
 KEEP = float(os.environ.get("KEEP", 0.5))  # share of a run's saving expected to survive its failures (most commits break a test)
 CAL = [1.0, 1.0]  # child CPU measured, predicted: this machine's speed against the one the map was made on
 
@@ -704,10 +712,13 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
             got, why = select(path, hunks, maps, every)
         if got is not None and "imp" in why.split("+") and not lazy_ok(patch):
             got = got | {n for n, i in ids.items() if i.endswith("::test_lazy_load")}
-        if why == "fixture" and path in TPC and same_inputs(path, hunks):
-            got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
-                   or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
-            why = "fixture-inputs"
+        if why == "fixture" and path.endswith(".sql") and (r := reads(path, hunks)):
+            if r[0] == r[1]:  # comments, blank lines: no test can see the edit
+                got, why = set(), "fixture-same"
+            elif path in TPC and same_inputs(r):
+                got = {n for n in got if not ids[n].startswith("tests/test_executor.py::")
+                       or (path == TPC[1] and ids[n].endswith("::test_optimized_tpch"))}
+                why = "fixture-inputs"
         whys.append(why)
         sel[path] = got
         chosen |= every if got is None else got
@@ -737,6 +748,7 @@ def main():
             chosen, whys = every, ["error", type(x).__name__]
         out[patch] = chosen, whys
     limit = 140 * max(1, len(patches) / 40)  # the batch has 3 min for 40 commits, 4.5 for 60: runs stop well before
+    spent = 0.0  # child CPU of the runs so far: the board adds every CPU second to the score
     for _, patch, files in sorted(queue, key=lambda q: -q[0]):  # best saving per CPU second first
         chosen, whys = out[patch]
         p = plan(chosen, files, ids, ms)  # again, at this machine's measured speed
@@ -744,10 +756,10 @@ def main():
             continue
         s = CAL[0] / CAL[1]
         wait = 2 * s * p[2] + 2  # a patch that makes a test hang or crawl times the run out: keep what passed by then
-        if time.monotonic() - START + wait > limit:
+        if time.monotonic() - START + wait > limit or spent + s * p[2] > BUDGET:
             continue
         ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
-        CAL[0], CAL[1] = CAL[0] + cpu, CAL[1] + p[2]
+        CAL[0], CAL[1], spent = CAL[0] + cpu, CAL[1] + p[2], spent + cpu
         if ok:
             num = {ids[n]: n for n in p[1]}
             out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
