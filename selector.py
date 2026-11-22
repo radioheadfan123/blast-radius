@@ -457,6 +457,45 @@ RESC = {}  # path -> coverage tests if its only import-time edits sit in functio
 NOCACHE = {"sqlglot/generator.py": {"_build_dispatch", "__init__"}}
 
 
+def dict_lines(tree):
+    """Lines of the dict displays assigned at module or class level (keymap.py recorded those per key)."""
+    lines = set()
+
+    def body(b):
+        for s in b:
+            if isinstance(s, (ast.Assign, ast.AnnAssign)) and isinstance(s.value, (ast.Dict, ast.DictComp)):
+                lines.update(range(s.value.lineno, s.value.end_lineno + 1))
+            elif isinstance(s, ast.ClassDef):
+                body(s.body)
+            elif isinstance(s, (ast.If, ast.Try, ast.With)):
+                for b2 in [s.body, getattr(s, "orelse", []), getattr(s, "finalbody", [])] + [h.body for h in getattr(s, "handlers", [])]:
+                    body(b2)
+    body(tree.body)
+    return lines
+
+
+_quiet = {}
+
+
+def quiet(tree, ln, texts, new=False):
+    """An import-level line whose whole effect the state snapshot sees, so pick() may still explain it: inside a dict
+    display, inside a def the patch adds (new), or blank or comment only and outside any string."""
+    if id(tree) not in _quiet:
+        s, f = set(), set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Constant, ast.JoinedStr)) and n.end_lineno > n.lineno:
+                s.update(range(n.lineno, n.end_lineno + 1))
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                f.update(range(n.lineno, n.end_lineno + 1))
+        if len(_quiet) > 3:
+            _quiet.clear()
+        _quiet[id(tree)] = tree, s, f, dict_lines(tree)
+    _, s, f, d = _quiet[id(tree)]
+    if all(t is None or not t.strip() or t.lstrip().startswith("#") for t in texts):
+        return ln not in s
+    return ln in d or new and ln in f
+
+
 def select(path, hunks, m, every):
     sets = m["sets"]
     RT[path] = RESC[path] = None
@@ -482,10 +521,13 @@ def select(path, hunks, m, every):
             c0, c1 = span(o, w)
             reg = runtime(regs, ln, c0, c1) if o is not None and w is not None else None
             lo, hi = rng.get(ln, (ln, ln))
+            nm = None
             if o is None or w is None:  # a line added or removed outright: every test that ran the function it sits in
                 if o is None and nregs is None:
-                    nregs = regions(ast.parse("\n".join(pu.apply((SRC / path).read_text().splitlines(), hunks)) + "\n"))
-                reg = one_sided(regs, nregs, hunks, ln, o, w, next(ins) if o is None else None)
+                    ntree = ast.parse("\n".join(pu.apply((SRC / path).read_text().splitlines(), hunks)) + "\n")
+                    nregs = regions(ntree)
+                nm = next(ins) if o is None else None
+                reg = one_sided(regs, nregs, hunks, ln, o, w, nm)
                 if reg:
                     lo, hi = reg[0], reg[2]
             if reg and set(range(lo, hi + 1)) & set(m["imp"].get(path, ())):
@@ -502,7 +544,7 @@ def select(path, hunks, m, every):
                 elif resc is not None:
                     resc |= tests_in(fm, sets, lo, hi) or tests_in(fm, sets, reg[0], reg[2])
                 reg = None
-            elif not reg:
+            elif not reg and not (quiet(tree, ln, (o, w)) if nm is None else quiet(ntree, nm, (w,), new=True)):
                 resc = None
             if reg:
                 got = tests_in(fm, sets, lo, hi)
@@ -743,36 +785,36 @@ def nocode(v):
     return v
 
 
-def same_state(patch):
-    """True if the patched tree imports to the pinned state except for the code of functions (edited bodies)."""
-    diff = snapdiff(patch)
-    return diff is not None and all(x is not None and y is not None and nocode(x) == nocode(y) for x, y in diff.values())
+_names = set()  # every word of every pinned .py file, tests included
 
 
-def keysel(patch, files):
+def fresh(label, y):
+    """A function the patch adds as a class attribute, under a name no pinned source mentions: only patched code can
+    call it. Not a dunder (Python calls those) or a <key>_sql: the generators dispatch on that name (generator.py:79 and
+    4421, transforms.py:48, simplify.py:1982, the only built-name lookups); an override names its base, so it is not new."""
+    name = label.rsplit(".", 1)[1]
+    if not (y and y[0] == "fn" and label == f"{y[1]}.{y[2]}" and "." in y[2] and "<" not in y[2]) \
+            or name.startswith("__") or name.endswith("_sql"):
+        return False
+    if not _names:
+        for f in SRC.rglob("*.py"):
+            _names.update(re.findall(r"\w+", f.read_text(errors="replace")))
+    return name not in _names
+
+
+def keysel(patch, files, more=False):
     """When the patched tree imports to the same state as the pinned one except for entries added, removed or changed in
     dicts that map/keys.json recorded per key (dicts nothing iterated, copied or compared while tests ran), the tests
     that looked up one of those keys; else None. snap.py fingerprints every module global and class attribute after
-    importing every module, so an entry copied into other dicts or folded into anything else at import shows up too."""
+    importing every module, so an entry copied into other dicts or folded into anything else at import shows up too.
+    more: also allow code-only changes (pick() adds their coverage) and fresh() methods the patch adds."""
     base, km = HERE / "map" / "dsnap.pkl", HERE / "map" / "keys.json"
     left = BATCH - (time.monotonic() - START)
     if left < 15 or not (base.is_file() and km.is_file()):
         return None
     for p, hs in files.items():  # every edited line inside a dict display keymap.py recorded, or no ~3 s snapshot
-        lines = set()
-
-        def body(b):
-            for s in b:
-                if isinstance(s, (ast.Assign, ast.AnnAssign)) and isinstance(s.value, (ast.Dict, ast.DictComp)):
-                    lines.update(range(s.value.lineno, s.value.end_lineno + 1))
-                elif isinstance(s, ast.ClassDef):
-                    body(s.body)
-                elif isinstance(s, (ast.If, ast.Try, ast.With)):
-                    for b2 in [s.body, getattr(s, "orelse", []), getattr(s, "finalbody", [])] + [h.body for h in getattr(s, "handlers", [])]:
-                        body(b2)
-        body(ast.parse((SRC / p).read_text()).body)
-        if not {ln for ln, _, _ in edits(hs)} <= lines:  # a cheap filter: the snapshot diff below is the check
-            return None
+        if not more and not {ln for ln, _, _ in edits(hs)} <= dict_lines(ast.parse((SRC / p).read_text())):
+            return None  # a cheap filter: the snapshot diff below is the check
     diff = snapdiff(patch)
     if diff is None:
         return None
@@ -787,6 +829,8 @@ def keysel(patch, files):
         return None
     out = set()
     for (label, key), (x, y) in diff.items():
+        if more and (x is not None and y is not None and nocode(x) == nocode(y) or key is None and x is None and fresh(label, y)):
+            continue
         if "A" in K and label.endswith(".required_args") and key is None and x and y and x[0] == y[0] == "set":
             # arg_types values only feed required_args, which only error_messages reads: the tests where it ran on
             # an instance of this class missing a key that changed sides
@@ -940,11 +984,12 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         if ks is not None:
             chosen = ks | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
             whys.append(f"keys{len(ks)}")
-    if ("imp" in parts and not any(w.startswith("keys") for w in whys) and split(chosen, ms)[0] >= KEYMIN
-            and all(RESC.get(p) is not None and hs for p, hs in files.items()) and same_state(patch)):
-        # every import edit sits in a function body that import also ran, and import built the same state
-        chosen = set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
-        whys.append("rescue")
+    if (parts & {"imp", "attr", "cls"} and not any(w.startswith("keys") for w in whys) and split(chosen, ms)[0] >= KEYMIN
+            and all(RESC.get(p) is not None and hs for p, hs in files.items()) and (ks := keysel(patch, files, True)) is not None):
+        # every import edit sits in a function body that import also ran, a dict display, a def the patch adds, or is
+        # blank, and import built the same state but for recorded keys, code and fresh() methods: keys' tests + coverage
+        chosen = ks | set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
+        whys.append(f"rescue{len(ks)}")
     for num, name in gated.items():
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
