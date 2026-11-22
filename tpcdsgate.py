@@ -204,11 +204,10 @@ except Exception as x:  # noqa: no map, bad input: check every query
     ONLY = None
 print("only", ONLY and [sorted(x) for x in ONLY], file=sys.stderr)  # for tools
 ONLY, FULL = ONLY or (None, set())
-if patched and (ONLY is None and any(p.startswith("sqlglot/executor/") for p in pu.parse(open(sys.argv[1]).read()))
-                or sum(float(pfull.get(str(i), "x 1e9").split()[1]) for i in FULL) > EXEC_BUDGET):
-    # an executor edit the map cannot narrow: re-run every executed query on the full tables, as the test does
-    ONLY, FULL = None, {int(i) for i in pfull}
-    EXEC_BUDGET = sum(float(v.split()[1]) for v in pfull.values()) + 1
+if patched and ONLY is None and any(p.startswith("sqlglot/executor/") for p in pu.parse(open(sys.argv[1]).read())):
+    FULL = {int(i) for i in pfull}  # an executor edit the map cannot narrow: re-run every executed query, as the test does
+if patched and FULL:  # only the queries whose full-data run reaches the edit, however long they take
+    EXEC_BUDGET = sum(float(pfull.get(str(i), "x 1e9").split()[1]) for i in FULL) + 1
 pieces, fulls, spent, budget = [const], [], 0.0, 0.0
 for i, (meta, sql, _) in enumerate(QUERIES):
     if ONLY is not None and i not in ONLY | FULL:
