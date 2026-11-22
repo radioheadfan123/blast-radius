@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import patchutil as pu  # noqa: E402
 
 SRC = os.environ.get("SQLGLOT_SRC", "/opt/sqlglot")
+MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map")
 ROWS = int(os.environ.get("GATE_ROWS", 200))  # rows read per table: enough for scans and filters to return rows
 BUDGET = float(os.environ.get("GATE_BUDGET", 6))  # full-data re-runs cost CPU; past this the test is just kept
 COV = os.environ.get("GATE_COV")  # build: write map/tpcds.cov, the sqlglot lines each query runs from a cold start
@@ -69,7 +70,9 @@ record = py.compile = lambda src, *a, **k: (code.append(src), _compile(src, *a, 
 
 def load(limit):
     """Tables as the test's setUpClass loads them (first `limit` rows when given)."""
-    tables = {}
+    tables, ROWS_FILE = {}, os.path.join(MAP, "tpcds.rows")  # the full tables' rows, pickled by the build run
+    if limit is None and patched and os.path.exists(ROWS_FILE):  # 0.15 s instead of 0.8 s of csv parsing
+        return {n: Table(columns=cols, rows=r) for (n, cols), r in zip(TPCDS_SCHEMA.items(), pickle.load(open(ROWS_FILE, "rb")))}
     for name, cols in TPCDS_SCHEMA.items():
         with gzip.open(f"{FIXTURES_DIR}/optimizer/tpc-ds/{name}.csv.gz", "rt", newline="") as f:
             reader = csv.reader(f, delimiter="|")
@@ -84,13 +87,18 @@ def load(limit):
                             ctypes.append(str)
                 rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
         tables[name] = Table(columns=cols, rows=rows)
+    if limit is None and not patched:
+        try:
+            pickle.dump([t.rows for t in tables.values()], open(ROWS_FILE, "wb"), protocol=5)
+        except OSError:
+            pass
     return tables
 
 
-def full_run(e, sql):
+def full_run(e, sql, opt=None):
     """md5 of what the test compares for one query on the full tables, and the CPU seconds it took."""
     t = time.process_time()
-    ex.optimize, ex.Plan, planner.Plan, py.compile = _opt, _plan, _plan, _compile  # no recording here
+    ex.optimize, ex.Plan, planner.Plan, py.compile = opt or _opt, _plan, _plan, _compile  # no recording here
     try:
         res = ex.execute(e, schema=TPCDS_SCHEMA, tables={x.name: big[x.name] for x in find_tables(e)})
     finally:
@@ -105,7 +113,6 @@ big = None  # full tables, loaded (and pickled to the worker, as initargs are) o
 const = hashlib.md5(repr([sorted(map(str, exp.DataType.TEXT_TYPES)), sorted(map(str, exp.DataType.NUMERIC_TYPES)),
                           sorted(Generator.TIME_PART_SINGULARS.items()), [(d.name, str(d.value)) for d in exp.DType],
                           [is_int(x) for x in ("1", "-2", "a", "1.5", "")], seq_get([1], 0), seq_get([1], 3)]).encode()).hexdigest()[:8]
-MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map")
 patched = len(sys.argv) > 1
 want = open(os.path.join(MAP, "tpcds.steps")).read().split() if patched else None
 pfull = dict(ln.split(None, 1) for ln in open(os.path.join(MAP, "tpcds.full")).read().splitlines()) if patched else {}
@@ -209,6 +216,16 @@ if patched and ONLY is None and any(p.startswith("sqlglot/executor/") for p in p
 if patched and FULL:  # only the queries whose full-data run reaches the edit, however long they take
     EXEC_BUDGET = sum(float(pfull.get(str(i), "x 1e9").split()[1]) for i in FULL) + 1
 pieces, fulls, spent, budget = [const], [], 0.0, 0.0
+# An edit only to the executor's run-time modules cannot change what optimize returns (sqlglot.optimizer and the planner
+# never import the executor; executor/__init__.py, which calls optimize, is excluded), so the full-data re-runs take each
+# query's optimized tree from the build run and skip the optimizer (27.7 -> 20.4 s CPU here with the cached rows).
+# ponytail: assumes executor modules leave optimizer-visible globals alone; fuzz-checked, not proven
+OPTS = {}
+if patched and all(p.startswith("sqlglot/executor/") and p != "sqlglot/executor/__init__.py" for p in pu.parse(open(sys.argv[1]).read())):
+    try:
+        OPTS = pickle.load(open(os.path.join(MAP, "tpcds.opt"), "rb"))
+    except Exception:  # noqa: no cache: optimize as the test does
+        pass
 for i, (meta, sql, _) in enumerate(QUERIES):
     if ONLY is not None and i not in ONLY | FULL:
         continue  # runs no edited line: its piece is the pristine one
@@ -224,7 +241,12 @@ for i, (meta, sql, _) in enumerate(QUERIES):
         continue
     if not patched:
         big = big or pickle.loads(pickle.dumps(load(None)))
-        fulls.append("%d %s %.3f" % (i, *full_run(e, sql)))
+        def keep(*a, **k):  # the optimized tree and its CPU s, for executor-only edits
+            t = time.process_time()
+            r = _opt(*a, **k)
+            OPTS[i] = (pickle.dumps(r), time.process_time() - t)
+            return r
+        fulls.append("%d %s %.3f" % (i, *full_run(e, sql, keep)))
     elif i in FULL or piece != (want[i + 1] if i + 1 < len(want) else None):
         try:
             gold, gold_t = pfull[str(i)].split()
@@ -233,8 +255,9 @@ for i, (meta, sql, _) in enumerate(QUERIES):
                 raise TimeoutError
             if big is None:
                 big = pickle.loads(pickle.dumps(load(None)))
-            md5, took = full_run(e, sql)
-            spent += took
+            o = OPTS.get(i)
+            md5, took = full_run(e, sql, o and (lambda *a, **k: pickle.loads(o[0])))
+            spent += took + (o[1] if o else 0)  # as the test pays it, optimizer included
         except Exception:  # noqa: over budget, or a query that fails or is missing from the pristine run
             md5, gold = None, ""
         print("rerun", i, md5 == gold, file=sys.stderr)  # for tools/v3check.py
@@ -245,6 +268,7 @@ if not patched:
     try:
         open(os.path.join(MAP, "tpcds.steps"), "w").write(" ".join(pieces))
         open(os.path.join(MAP, "tpcds.full"), "w").write("\n".join(fulls) + "\n")
+        pickle.dump(OPTS, open(os.path.join(MAP, "tpcds.opt"), "wb"))
     except OSError:
         pass
     print(hashlib.md5(" ".join(pieces).encode()).hexdigest())
