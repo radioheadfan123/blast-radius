@@ -945,6 +945,10 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         # every import edit sits in a function body that import also ran, and import built the same state
         chosen = set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
         whys.append("rescue")
+    if whys and (whys[-1] == "rescue" or whys[-1].startswith("keys")) and any(p.startswith("sqlglot/typing/") for p in files):
+        # test_typing reads typing/*.py source and flags a child entry equal to (not the same object as) its parent's:
+        # a redundant re-statement imports to the same state, so neither the snapshot nor a lookup sees it
+        chosen |= {n for n, i in ids.items() if i.startswith("tests/test_typing.py::")}
     for num, name in gated.items():
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
