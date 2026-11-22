@@ -750,7 +750,7 @@ def same_state(patch):
 
 
 def keysel(patch, files):
-    """When the patched tree imports to the same state as the pinned one except for values of existing entries in
+    """When the patched tree imports to the same state as the pinned one except for entries added, removed or changed in
     dicts that map/keys.json recorded per key (dicts nothing iterated, copied or compared while tests ran), the tests
     that looked up one of those keys; else None. snap.py fingerprints every module global and class attribute after
     importing every module, so an entry copied into other dicts or folded into anything else at import shows up too."""
@@ -799,8 +799,12 @@ def keysel(patch, files):
         if "A" in K and label.endswith(".arg_types") and key is not None and x is not None and y is not None:
             continue  # a value read only by __init_subclass__ (core.py:110); its effect is the required_args entry
         e = K["d"].get(label)
-        if key is None or x is None or y is None or not e or "k" not in e or e["k"].get(key, 0) == -1:
-            return None  # not a dict value, a key added or removed, or a dict read some other way
+        if key is None and e and "k" in e and x and y and x[0] == y[0] == "dict" and x[1] and y[1]:
+            continue  # its size: a key added or removed (each key's own entry selects); never to or from empty (truthiness)
+        if key is None or x is None and y is None or not e or "k" not in e or e["k"].get(key, 0) == -1:
+            return None  # not a dict entry, or a dict read some other way
+        # an added key: keymap.py recorded missed lookups too (get, [], in), so the tests that looked it up; a removed
+        # key: the tests that found it
         if key in e["k"]:
             out |= set(K["sets"][e["k"][key]])
     return out
