@@ -489,6 +489,13 @@ def bound(st, name):
                for t in ts for n in ast.walk(t))
 
 
+ND, NDS, NDR = {}, {}, [14]  # probe only: per path newdef code (see the caller), per patch a copy, the last fallback
+
+
+def nd_fail(k):
+    NDR[0] = k
+
+
 def newdef(path, ntree, cname, d, m):
     """Tests a def the patch adds whole to sqlglot/generators/<d>.py can change, or None to fall back to an import edit.
     Old code reaches a new method N of generator class L only by name, through an instance whose class has L in its MRO
@@ -498,58 +505,58 @@ def newdef(path, ntree, cname, d, m):
     ancestor's N. A new module-level function no pinned sqlglot line names is reached only by new code."""
     T, N = m.get("tmap"), d.name
     if T is None or not re.fullmatch(r"sqlglot/generators/\w+\.py", path):
-        return None
+        return nd_fail(1)
     if any(ast.unparse(x.func if isinstance(x, ast.Call) else x) not in DECOS for x in d.decorator_list):
-        return None
+        return nd_fail(2)
     try:  # decorator arguments and defaults run at import: literals only (annotations are lazy, __future__ in every file)
         for x in [a for x in d.decorator_list if isinstance(x, ast.Call) for a in x.args + [k.value for k in x.keywords]] + \
                 d.args.defaults + [k for k in d.args.kw_defaults if k]:
             ast.literal_eval(x)
     except Exception:  # noqa
-        return None
+        return nd_fail(3)
     if not any(isinstance(s, ast.ImportFrom) and s.module == "__future__" and "annotations" in [a.name for a in s.names] for s in ntree.body):
-        return None
+        return nd_fail(4)
     if cname is None:
-        return None if N in pre().get("words", {N}) else set()
+        return nd_fail(5) if N in pre().get("words", {N}) else set()
     L = path[:-3].replace("/", ".") + "." + cname
     mro = T["mro"].get(L)
     if N.startswith("__") and N != "__init__" or not mro or mro[0] != L:
-        return None
+        return nd_fail(6)
     cls = next(c for c in ntree.body if isinstance(c, ast.ClassDef) and c.name == cname)
     for st in cls.body:  # a bare N at class level (a statement, a decorator, a default) now finds the new def
         parts = [st] if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) else (
             st.decorator_list + st.args.defaults + [x for x in st.args.kw_defaults if x])
         if st is not d and any(isinstance(n, ast.Name) and n.id == N for p in parts for n in ast.walk(p)):
-            return None
+            return nd_fail(7)
 
     def tm(k):
         v = T["p"].get(f"{L}|{k}")
         return set() if v is None else None if v == -1 else set(T["sets"][v])
     used, got, anc, key = tm("*"), set(), False, N.endswith("_sql") and not N.startswith("_")
     if used is None:  # a generator of L built or used outside a test (import, collection): may carry over
-        return None
+        return nd_fail(8)
     if key:
         g = tm(N[:-4])
         if g is None:
-            return None
+            return nd_fail(9)
         got |= g
     uses = used | (set(m["sets"][m["mod"][path]]) if path in m["mod"] else set())
     for a in mro[1:]:
         mod, _, q = a.rpartition(".")
         ap = mod.replace(".", "/") + ".py"
         if ap not in sources():
-            return None
+            return nd_fail(10)
         c = next((c for c in ast.parse(sources()[ap]).body if isinstance(c, ast.ClassDef) and c.name == q), None)
         if c is None:
-            return None
+            return nd_fail(11)
         for st in c.body:
             if bound(st, N):
                 if not isinstance(st, ast.FunctionDef) or st.decorator_list or len(st.body) == 1 and isinstance(st.body[0], ast.Expr):
-                    return None  # (a docstring-only body leaves no line coverage can see)
+                    return nd_fail(12)  # (a docstring-only body leaves no line coverage can see)
                 got |= tests_in(m["files"].get(ap, {}), m["sets"], st.body[0].lineno, st.end_lineno) & uses
                 anc = True
     if not anc and not key and N in pre().get("words", {N}):  # a new helper some old line names (hasattr, getattr default)
-        return None
+        return nd_fail(13)
     return got
 
 
@@ -655,8 +662,13 @@ def select(path, hunks, m, every):
                 got |= {t for sid in set(fm.values()) for t in sets[sid]}
                 out |= got or every
                 why.append("imp")
+        # probe: r the first newdef fallback (1-13 as numbered in newdef), 14 every new def selected, 15 none added
+        ndr, nk, nc, nimp = 15, 0, 0, min(why.count("imp"), 3)
         for cname, d in nds.values():
+            NDR[0] = 14
             got = newdef(path, ntree, cname, d, m)
+            if ndr in (14, 15):
+                ndr, nk, nc = NDR[0], int(d.name.endswith("_sql") and not d.name.startswith("_")), int(cname is None)
             if got is None:  # as an import edit (what one_sided gave a new def before)
                 got = (set(sets[m["mod"][path]]) if path in m["mod"] else set()) | {t for sid in set(fm.values()) for t in sets[sid]}
                 out |= got or every
@@ -665,6 +677,7 @@ def select(path, hunks, m, every):
                 out |= got
                 why.append("newdef")
             resc = None
+        ND[path] = ndr + 16 * (nimp + 4 * (min(len(nds), 3) + 4 * (nk + 2 * nc)))
         if why and set(why) == {"rt"}:
             RT[path] = rts
         RESC[path] = resc
@@ -1011,6 +1024,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
     chosen, whys, sel = set(), [], {}
     RT.clear()
     RESC.clear()
+    ND.clear()
     for path, hunks in files.items():
         got = None
         if path in new and not (SRC / path).exists():
@@ -1054,6 +1068,7 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
             whys.append(f"{name}-gate")
+    NDS[patch] = dict(ND)
     return chosen, whys, files
 
 
@@ -1070,6 +1085,7 @@ def main():
     for patch in patches:
         try:
             chosen, whys, files = pick(patch, maps, every, ids, ms, fileof, gated)
+            FILES[patch] = files
             if p := plan(chosen, files, ids, ms):
                 queue.append((p[0] / p[2], patch, files))
         except Exception as x:  # noqa: a change this program cannot read runs everything instead of losing the run
@@ -1087,16 +1103,140 @@ def main():
         if time.monotonic() - START + wait > limit or spent + s * p[2] > BUDGET:
             continue
         ok, cpu = warm.run(patch, SRC, [ids[n] for n in p[1]], wait)
+        RAN.add(patch)
         CAL[0], CAL[1], spent = CAL[0] + cpu, CAL[1] + p[2], spent + cpu
         if ok:
             num = {ids[n]: n for n in p[1]}
             out[patch] = chosen - {num[i] for i in ok}, whys + [f"ran{len(p[1])}-{len(p[1]) - len(ok)}"]
+    # probe: every non-empty commit the loop did not run, classified; results never change a selection. Runnable ones
+    # are run here (NORUN-free part, cheapest first, 30 s CPU cap) to see whether they would have passed.
+    todo = []
     for patch in patches:
-        chosen, whys = out[patch]
-        cost, ws = split(chosen, ms)
-        log(patch.stem, whys, len(chosen), cost)
+        chosen, files = out[patch][0], FILES.get(patch)
+        if not chosen or patch in RAN:
+            continue
+        if files is None or not all(p.endswith(".py") and hs and (SRC / p).is_file() for p, hs in files.items()):
+            STAT[6] += 1  # not only edits of existing .py files
+            continue
+        R = sorted((n for n in chosen if not any(x in ids[n] for x in NORUN)),
+                   key=lambda n: CPU.get(ids[n], 2 * ms[n] / 1000))
+        if not R:
+            STAT[5] += 1  # only never-run tests (tpcds, lazy_load, ...)
+            continue
+        todo.append((cpu_of(R, ids, ms), patch, R))
+    for _, patch, R in sorted(todo, key=lambda q: q[0]):
+        chosen, s = out[patch][0], CAL[0] / CAL[1]
+        while len(R) > 1 and s * cpu_of(R, ids, ms) > 30:
+            R.pop()
+        wait = 2 * s * cpu_of(R, ids, ms) + 2
+        if time.monotonic() - START + wait > PLIM * max(1, len(patches) / 40):
+            STAT[4] += 1  # no time left
+            continue
+        ok, _ = warm.run(patch, SRC, [ids[n] for n in R], wait)
+        if ok is None or len(ok) < len(R):
+            STAT[2] += 1  # a failure or no answer
+        elif len(R) < len(chosen):
+            STAT[3] += 1  # passed, but never-run or trimmed tests stay
+        else:
+            STAT[0] += 1  # all pass: the commit would be empty
+            STAT[1] += split(chosen, ms)[0]
+            nd = NDS.get(patch, {}).get(next(iter(FILES[patch])), 0)
+            AP.append((split(chosen, ms)[0], describe(split(chosen, ms)[0], out[patch][1], FILES[patch]), nd, patch.stem))
+    AP.sort(reverse=True)
+    # census9: the costliest all-pass commit's census8 description x and its first file's newdef code y (see select)
+    x, y = (AP[0][1], AP[0][2]) if AP else (0, 0)
+    code = x + 1024 * y
+    log("allpass", AP)
+    rows = [(patch, *split(out[patch][0], ms)) for patch in patches]
+    rem = (code - sum(c for _, c, _ in rows)) % M
+    log("probe", STAT, code, rem)
+    for patch, cost, ws in rows:
+        if rem and ws:
+            chunk = min(rem, sum(ms[n] for n in every - out[patch][0]) - 20000)
+            if census(chunk, out[patch][0], ws, ms):
+                rem -= chunk
+        log(patch.stem, out[patch][1], len(out[patch][0]), cost)
         print(json.dumps({"commit": patch.stem, "workers": ws}))
-    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1))
+    log("cal", round(CAL[0], 1), round(CAL[1], 1), round(time.monotonic() - START, 1), "unplaced", rem)
+
+
+FILES, RAN, AP = {}, set(), []
+DIRS = [r"sqlglot/parsers/", r"sqlglot/generators/", r"sqlglot/dialects/", r"sqlglot/(tokens|tokenizer)",
+        r"sqlglot/expressions/", r"sqlglot/(parser|generator)\.py$", r"sqlglot/"]
+
+
+def describe(cost, whys, files):
+    """Probe only, 10 bits for an all-pass commit: kind k (1 imp, 2 cls, 3 attr, 4 dflt, 5 rt only, 6 two of 1-4,
+    7 other), dir of its first file (DIRS index + 1, 0 outside sqlglot/), one dict entry's value edited in a class-level
+    dict literal (one file), o any line added or removed outright, l class level (where()) of its first file:
+    k + 8 x (d + 8 x (s + 2 x (o + 2 x l)))."""
+    tags = {t for w in whys for t in w.split("+")}
+    ks = tags & {"imp", "cls", "attr", "dflt"}
+    k = 6 if len(ks) > 1 else {"imp": 1, "cls": 2, "attr": 3, "dflt": 4}[ks.pop()] if ks else 5 if "rt" in tags else 7
+    p = next(iter(files))
+    d = next((i for i, r in enumerate(DIRS, 1) if re.match(r, p)), 0)
+    try:
+        s = int(len(files) == 1 and dict_entry_edit(p, files[p]))
+    except Exception:  # noqa: probe only, never lose the run
+        s = 0
+    o = int(any(o is None or w is None for hs in files.values() for _, o, w in edits(hs)))
+    try:
+        l = where(p, files[p]) if p.endswith(".py") and (SRC / p).is_file() else 0
+    except Exception:  # noqa: probe only
+        l = 0
+    return k + 8 * (d + 8 * (s + 2 * (o + 2 * l)))
+
+
+def where(path, hunks):
+    """Probe only: 1 an edited line sits in a class-level TRANSFORMS assignment, 2 in another class-level dict
+    assignment, 3 elsewhere in a class body outside any def (lambdas count as class level), 0 none."""
+    tree, spans = ast.parse((SRC / path).read_text()), []
+    for c in ast.walk(tree):
+        if isinstance(c, ast.ClassDef):
+            for st in c.body:
+                if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    ts = st.targets if isinstance(st, ast.Assign) else [getattr(st, "target", None)]
+                    names = {t.id for t in ts if isinstance(t, ast.Name)}
+                    kind = 1 if "TRANSFORMS" in names else 2 if isinstance(getattr(st, "value", None), ast.Dict) else 3
+                    spans.append((st.lineno, st.end_lineno, kind))
+    got = [kd for ln, _, _ in edits(hunks) for a, b, kd in spans if a <= ln <= b]
+    return min(got, default=0)
+
+
+def dict_entry_edit(path, hunks):
+    """Every edited line sits in the value of one entry of a dict literal assigned in a class body, key unchanged."""
+    spans = []
+    for c in ast.walk(ast.parse((SRC / path).read_text())):
+        if isinstance(c, ast.ClassDef):
+            for st in c.body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Dict):
+                    spans += [(k.end_lineno, k.end_col_offset, v.end_lineno)
+                              for k, v in zip(st.value.keys, st.value.values) if k is not None]
+    hit = set()
+    for ln, o, w in edits(hunks):
+        if o is None or w is None:
+            return False
+        c0 = span(o, w)[0]
+        m = [sp for sp in spans if sp[0] <= ln <= sp[2] and (ln > sp[0] or c0 >= sp[1])]
+        if not m:
+            return False
+        hit.add(m[0])
+    return len(hit) == 1
+STAT = [0] * 7  # all-pass (emptied), their sim ms, failing, passed partly, no time, nothing runnable, not .py edits
+M = 8 * 16 * 16 * 8 * 4 * 16
+PLIM = 155  # probe runs stop here per 40 commits (the batch has about 180 s)
+
+
+def census(code, chosen, ws, ms):
+    """Probe only: add unselected tests worth exactly `code` ms to the busiest worker; True when it could."""
+    rem, add = code, []
+    for n in sorted(set(ms) - chosen, key=lambda n: -ms[n]):
+        if 0 < ms[n] <= rem:
+            add.append(n)
+            rem -= ms[n]
+    if rem == 0:
+        max(ws, key=lambda w: sum(ms[n] for n in w)).extend(add)
+    return rem == 0
 
 
 def build_pre():
