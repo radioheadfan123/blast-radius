@@ -1140,10 +1140,9 @@ def main():
         else:
             STAT[0] += 1  # all pass: the commit would be empty
             STAT[1] += split(chosen, ms)[0]
-            nd = NDS.get(patch, {}).get(next(iter(FILES[patch])), 0)
-            AP.append((split(chosen, ms)[0], describe(split(chosen, ms)[0], out[patch][1], FILES[patch]), nd, patch.stem))
+            AP.append((split(chosen, ms)[0], *census10(patch, out[patch][1]), patch.stem))
     AP.sort(reverse=True)
-    # census9: the costliest all-pass commit's census8 description x and its first file's newdef code y (see select)
+    # census10: the costliest all-pass commit's file census x and its first import-edit file's newdef code y
     x, y = (AP[0][1], AP[0][2]) if AP else (0, 0)
     code = x + 1024 * y
     log("allpass", AP)
@@ -1185,6 +1184,23 @@ def describe(cost, whys, files):
     except Exception:  # noqa: probe only
         l = 0
     return k + 8 * (d + 8 * (s + 2 * (o + 2 * l)))
+
+
+WHY10 = ["docs", "same-ast", "same-meaning", "test", "broken", "new", "pack", "sqlglotc", "fixture", "fixture-same",
+         "fixture-inputs", "unknown"]
+
+
+def census10(patch, whys):
+    """Probe only, (x, y) for an all-pass commit. x = c + 16 x (n + 8 x d): c the first file's why (WHY10 index + 1,
+    13 the sqlglot .py rules, 0 none), n min(files, 7), d the DIRS code (as describe) of the first file whose why has
+    imp. y = that file's newdef code from select() (0 none)."""
+    files = list(FILES[patch])
+    ws = whys[:len(files)]
+    w0 = ws[0] if ws else None
+    c = 0 if w0 is None else WHY10.index(w0) + 1 if w0 in WHY10 else 13
+    p = next((f for f, w in zip(files, ws) if w and "imp" in w.split("+")), files[0])
+    d = next((i for i, r in enumerate(DIRS, 1) if re.match(r, p)), 0)
+    return c + 16 * (min(len(files), 7) + 8 * d), NDS.get(patch, {}).get(p, 0)
 
 
 def where(path, hunks):
