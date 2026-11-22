@@ -1,7 +1,7 @@
 """Runs tests on a patched tree in a child forked from this process, as runtests.py did in a fresh python.
 The parent preloads the heavy third-party modules the tests import (numpy, pandas, duckdb) but never sqlglot, so each
 child imports sqlglot and the tests from the patched tree exactly as a fresh process would, minus the start-up cost."""
-import concurrent.futures as cf, contextlib, json, os, pickle, signal, sys, unittest
+import concurrent.futures as cf, contextlib, json, os, pickle, resource, signal, sys, unittest
 
 import patchutil as pu
 
@@ -129,7 +129,7 @@ def _child(patch, src, ids):
 
 
 def run(patch, src, ids, timeout):
-    """(ids that passed, or None when that cannot be told here; child CPU seconds)."""
+    """(ids that passed, or None when that cannot be told here; child CPU seconds; child peak RSS MB)."""
     prime()
     sys.stdout.flush(), sys.stderr.flush()
     r, w = os.pipe()
@@ -138,6 +138,10 @@ def run(patch, src, ids, timeout):
         os.close(r)
         out = None
         try:
+            vm = int(open("/proc/self/statm").read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+            hard = resource.getrlimit(resource.RLIMIT_AS)[1]  # a patch that blows memory up raises MemoryError here (the
+            soft = vm + (1 << 30)  # tests are kept) instead of the 4 GB container killing the run; 1 GB past what it holds
+            resource.setrlimit(resource.RLIMIT_AS, (soft if hard == resource.RLIM_INFINITY else min(soft, hard), hard))
             signal.signal(signal.SIGALRM, _stop)
             signal.alarm(max(1, int(timeout)))
             dn = os.open(os.devnull, os.O_WRONLY)
@@ -155,4 +159,4 @@ def run(patch, src, ids, timeout):
     os.close(r)
     _, status, ru = os.wait4(pid, 0)
     cpu = ru.ru_utime + ru.ru_stime
-    return (json.loads(data) if status == 0 and data else None), cpu
+    return (json.loads(data) if status == 0 and data else None), cpu, ru.ru_maxrss // 1024
