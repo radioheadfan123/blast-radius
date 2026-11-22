@@ -782,11 +782,23 @@ def keysel(patch, files):
             am = HERE / "map" / "args.json"
             if am.is_file():
                 _keys["A"] = json.loads(am.read_text())
+            em = HERE / "map" / "emap.json"
+            if em.is_file():
+                _keys["E"] = json.loads(em.read_text())
         K = _keys
     except Exception:  # noqa: timeout
         return None
     out = set()
     for (label, key), (x, y) in diff.items():
+        if "E" in K and label.endswith("EXPRESSION_METADATA"):
+            # typing/*.py and the dialect class copies: tools/emap.py recorded every lookup (hits and misses) per key,
+            # and the tests that read one in bulk (test_typing iterates them), which every such edit selects
+            if key is None:  # its size: a key added or removed, never to or from empty (truthiness)
+                if x and y and x[0] == y[0] == "dict" and x[1] and y[1]:
+                    continue
+                return None
+            out |= set(K["E"]["k"].get(key, ())) | set(K["E"]["b"])
+            continue
         if "A" in K and label.endswith(".required_args") and key is None and x and y and x[0] == y[0] == "set":
             # arg_types values only feed required_args, which only error_messages reads: the tests where it ran on
             # an instance of this class missing a key that changed sides
@@ -945,6 +957,10 @@ def pick(patch, maps, every, ids, ms, fileof, gated):
         # every import edit sits in a function body that import also ran, and import built the same state
         chosen = set().union(*RESC.values()) | {n for n in chosen if ids[n].endswith("::test_lazy_load")}
         whys.append("rescue")
+    if whys and (whys[-1] == "rescue" or whys[-1].startswith("keys")) and any(p.startswith("sqlglot/typing/") for p in files):
+        # test_typing reads typing/*.py source and flags a child entry equal to (not the same object as) its parent's:
+        # a redundant re-statement imports to the same state, so neither the snapshot nor a lookup sees it
+        chosen |= {n for n, i in ids.items() if i.startswith("tests/test_typing.py::")}
     for num, name in gated.items():
         if num in chosen and gateable(num, files, sel, name) and unchanged(name, patch, files):
             chosen.discard(num)
